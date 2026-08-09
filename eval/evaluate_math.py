@@ -3,13 +3,92 @@ import argparse
 import json
 import re
 from pathlib import Path
-from datasets import load_dataset
+from datasets import Features, Value, load_dataset
 from vllm import LLM, SamplingParams
 from transformers import AutoTokenizer
 from tqdm import tqdm
 
 # Use math_verify package directly
 from math_verify import parse, verify
+
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+DATASETS_CACHE = REPO_ROOT / ".cache" / "huggingface" / "datasets"
+DATASET_SPECS = {
+    "aime24": {
+        "directory": "aime24",
+        "problem": "problem",
+        "answer": "answer",
+        "id": "id",
+        "answer_dtype": "string",
+    },
+    "aime25": {
+        "directory": "aime25",
+        "problem": "problem",
+        "answer": "answer",
+        "id": "id",
+        "answer_dtype": "string",
+    },
+    "beyond-aime": {
+        "directory": "beyond-aime",
+        "problem": "problem",
+        "answer": "answer",
+        "id": None,
+        "answer_dtype": "int64",
+    },
+    "hmmt25": {
+        "directory": "hmmt25",
+        "problem": "problem",
+        "answer": "answer",
+        "id": "problem_idx",
+        "answer_dtype": "string",
+    },
+    "amo-bench": {
+        "directory": "amo-bench",
+        "problem": "prompt",
+        "answer": "answer",
+        "id": "question_id",
+        "answer_dtype": "string",
+    },
+}
+
+
+def resolve_path(path: str | Path) -> Path:
+    resolved = Path(path).expanduser()
+    if not resolved.is_absolute():
+        resolved = REPO_ROOT / resolved
+    return resolved.resolve()
+
+
+def load_local_eval_dataset(dataset_name: str, data_root: str | Path):
+    spec = DATASET_SPECS[dataset_name]
+    dataset_dir = resolve_path(data_root) / spec["directory"]
+    parquet_files = sorted((dataset_dir / "data").glob("*.parquet"))
+    if not parquet_files:
+        raise FileNotFoundError(
+            f"No prepared Parquet files found under {dataset_dir}. "
+            "Run `bash scripts/prepare_data.sh` first."
+        )
+    DATASETS_CACHE.mkdir(parents=True, exist_ok=True)
+    columns = [spec["problem"], spec["answer"]]
+    features = {
+        spec["problem"]: Value("string"),
+        spec["answer"]: Value(spec["answer_dtype"]),
+    }
+    if spec["id"]:
+        columns.append(spec["id"])
+        features[spec["id"]] = Value("int64")
+
+    dataset = load_dataset(
+        "parquet",
+        data_files={"test": [str(file) for file in parquet_files]},
+        split="test",
+        cache_dir=str(DATASETS_CACHE),
+        columns=columns,
+        features=Features(features),
+    )
+    print(f"Loaded {len(dataset)} problems from {dataset_dir}")
+    return dataset, spec
 
 
 def extract_boxed_answer(text: str) -> str:
@@ -64,6 +143,9 @@ def grade_answer(predicted: str, ground_truth: str) -> bool:
     """
     if predicted is None:
         return False
+
+    predicted = str(predicted)
+    ground_truth = str(ground_truth)
 
     try:
         # Ensure answers are wrapped in $ for latex parsing
@@ -145,9 +227,9 @@ def load_vllm_model(
             llm_config["max_loras"] = 1
             llm_config["max_cpu_loras"] = 1
         else:
-            print(f"Warning: No LoRA weights found at {lora_adapter_path}")
-            print("Continuing with base model only...")
-            lora_adapter_path = None
+            raise FileNotFoundError(
+                f"No LoRA weights found at {lora_adapter_path}; refusing to evaluate the base model by mistake."
+            )
 
     llm = LLM(**llm_config)
 
@@ -167,7 +249,7 @@ def load_vllm_model(
     return llm, tokenizer
 
 
-def evaluate_math500(
+def evaluate_math(
     llm,
     tokenizer,
     max_new_tokens: int,
@@ -179,13 +261,14 @@ def evaluate_math500(
     num_samples: int = None,
     output_file: str = None,
     lora_request=None,
-    dataset_name: str = "math500",
+    dataset_name: str = "aime24",
+    data_root: str = "data/eval",
     base_model_name: str = None,
     enable_thinking: bool = True,
     val_n: int = 1,
 ):
     """
-    Evaluate model on MATH500 or other datasets using Qwen3 thinking mode with best practices.
+    Evaluate a prepared local math dataset with Qwen3 thinking mode.
 
     Args:
         llm: The vLLM LLM instance
@@ -217,33 +300,8 @@ def evaluate_math500(
     print(f"Val-N (solutions per problem): {val_n}")
     print(f"{'='*70}\n")
 
-    print(f"Loading {dataset_name.upper()} dataset...")
-    # Load dataset based on dataset_name
-    if dataset_name.lower() == "math500":
-        dataset = load_dataset("HuggingFaceH4/MATH-500", split="test")
-        print(f"Loaded HuggingFaceH4/MATH-500 dataset with {len(dataset)} problems")
-    elif dataset_name.lower() == "amo-bench":
-        dataset = load_dataset("meituan-longcat/AMO-Bench", split="test")
-        print(f"Loaded meituan-longcat/AMO-Bench dataset with {len(dataset)} problems")
-    elif dataset_name.lower() == "minerva":
-        dataset = load_dataset("math-ai/minervamath", split="test")
-        print(f"Loaded minerva dataset with {len(dataset)} problems")
-    elif dataset_name.lower() == "amc23":
-        dataset = load_dataset("math-ai/amc23", split="test")
-        print(f"Loaded amc 23 dataset with {len(dataset)} problems")
-    elif dataset_name.lower() == "aime24":
-        dataset = load_dataset("HuggingFaceH4/aime_2024", split="train")
-        print(f"Loaded HuggingFaceH4/aime_2024 dataset with {len(dataset)} problems")
-    elif dataset_name.lower() == "aime25":
-        dataset = load_dataset("yentinglin/aime_2025", split="train", trust_remote_code=True)
-        print(f"Loaded yentinglin/aime_2025 dataset with {len(dataset)} problems")
-    elif dataset_name.lower() == "hmmt25":
-        dataset = load_dataset("MathArena/hmmt_feb_2025", split="train", trust_remote_code=True)
-        print(f"Loaded MathArena/hmmt_feb_2025 dataset with {len(dataset)} problems")
-    else:
-        raise ValueError(
-            f"Unknown dataset: {dataset_name}. Choose 'math500', 'amo-bench', 'aime24', 'aime25', 'hmmt25', 'minerva', or 'amc23'"
-        )
+    print(f"Loading local {dataset_name.upper()} dataset...")
+    dataset, dataset_spec = load_local_eval_dataset(dataset_name, data_root)
 
     # Limit to num_samples if specified
     if num_samples:
@@ -302,39 +360,10 @@ def evaluate_math500(
     all_question_ids = []
 
     for example in dataset:
-        # Handle different dataset formats
-        if dataset_name.lower() == "amo-bench":
-            problem = example["prompt"]
-            gt_answer = example["answer"]
-            question_id = example.get("question_id", None)
-        elif dataset_name.lower() == "aime24":
-            problem = example["problem"]
-            gt_answer = example["answer"]
-            question_id = example.get("id", None)
-        elif dataset_name.lower() == "minerva":
-            problem = example["question"]
-            gt_answer = example["answer"]
-            question_id = example.get("id", None)
-        elif dataset_name.lower() == "amc23":
-            problem = example["question"]
-            gt_answer = example["answer"]
-            question_id = example.get("id", None)
-        elif dataset_name.lower() == "aime25":
-            problem = example["problem"]
-            gt_answer = str(example["answer"])
-            question_id = example.get("problem_idx", None)
-        elif dataset_name.lower() == "hmmt25":
-            problem = example["problem"]
-            gt_answer = str(example["answer"])
-            question_id = example.get("problem_idx", None)
-        else:
-            # MATH500 format
-            problem = example["problem"]
-            gt_solution = example["solution"]
-            question_id = None
-            gt_answer = extract_boxed_answer(gt_solution)
-            if gt_answer is None:
-                gt_answer = gt_solution
+        problem = example[dataset_spec["problem"]]
+        gt_answer = str(example[dataset_spec["answer"]])
+        id_field = dataset_spec["id"]
+        question_id = example.get(id_field, None) if id_field else None
 
         # Format prompt following Qwen3 best practices for math problems
         user_message = (
@@ -517,6 +546,8 @@ def evaluate_math500(
 
         summary = {
             "base_model": base_model_name,
+            "checkpoint_dir": str(lora_request.lora_path) if lora_request is not None else None,
+            "data_root": str(resolve_path(data_root)),
             "dataset": dataset_name,
             "enable_thinking": enable_thinking,
             "temperature": temperature,
@@ -526,6 +557,7 @@ def evaluate_math500(
             "presence_penalty": presence_penalty,
             "max_new_tokens": max_new_tokens,
             "val_n": val_n,
+            "requested_num_samples": num_samples,
             "num_problems": num_problems,
             "total_solutions": total,
             "pass_at_n": pass_at_n,
@@ -544,7 +576,33 @@ def evaluate_math500(
 
         print(f"\nDetailed results saved to: {output_file}")
 
-    return average_at_n_pct, results
+    return pass_at_n_pct, average_at_n_pct, results
+
+
+def is_complete_result(path: Path, args: argparse.Namespace) -> bool:
+    if not path.is_file() or args.overwrite:
+        return False
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    results = data.get("results", [])
+    return (
+        data.get("base_model") == args.base_model
+        and data.get("checkpoint_dir") == args.checkpoint_dir
+        and data.get("dataset") == args.dataset
+        and data.get("enable_thinking") == args.enable_thinking
+        and data.get("val_n") == args.val_n
+        and data.get("requested_num_samples") == args.num_samples
+        and data.get("temperature") == args.temperature
+        and data.get("top_p") == args.top_p
+        and data.get("top_k") == args.top_k
+        and data.get("min_p") == args.min_p
+        and data.get("presence_penalty") == args.presence_penalty
+        and data.get("max_new_tokens") == args.max_new_tokens
+        and len(results) == data.get("num_problems")
+        and all(len(result.get("generations", [])) == args.val_n for result in results)
+    )
 
 
 def main():
@@ -552,7 +610,7 @@ def main():
     parser.add_argument(
         "--base_model",
         type=str,
-        default="/infra/old-home/home/siyanzhao/models/Qwen3-4B-Instruct-2507",
+        default="models/Qwen3-4B",
         help="Path to base model",
     )
     parser.add_argument(
@@ -564,9 +622,15 @@ def main():
     parser.add_argument(
         "--dataset",
         type=str,
-        default="math500",
-        choices=["math500", "amo-bench", "aime24", "aime25", "hmmt25", "minerva", "amc23"],
-        help="Dataset to use for evaluation (default: math500)",
+        default="aime24",
+        choices=list(DATASET_SPECS),
+        help="Prepared local dataset to evaluate",
+    )
+    parser.add_argument(
+        "--data_root",
+        type=str,
+        default="data/eval",
+        help="Repository-relative root containing the prepared evaluation datasets",
     )
     parser.add_argument(
         "--max_new_tokens",
@@ -611,6 +675,7 @@ def main():
         "--num_samples", type=int, default=None, help="Number of samples to evaluate (None = all)"
     )
     parser.add_argument("--output_file", type=str, default=None, help="Path to save detailed results JSON")
+    parser.add_argument("--overwrite", action="store_true", help="Overwrite a complete existing result")
     parser.add_argument(
         "--gpu_memory_utilization",
         type=float,
@@ -630,14 +695,14 @@ def main():
         help="Maximum model context length (auto: 40960 for thinking, 32768 for non-thinking)",
     )
     parser.add_argument(
-        "--val_n", type=int, default=6, help="Number of solutions to sample per problem (default: 6)"
+        "--val_n", type=int, default=16, help="Number of solutions to sample per problem (default: 16)"
     )
 
     args = parser.parse_args()
 
     # Validate checkpoint directory exists if provided
     if args.checkpoint_dir is not None:
-        checkpoint_path = Path(args.checkpoint_dir)
+        checkpoint_path = resolve_path(args.checkpoint_dir)
         if not checkpoint_path.exists():
             print(f"\n{'='*70}")
             print("ERROR: Checkpoint directory does not exist")
@@ -648,7 +713,15 @@ def main():
                 "\nPlease provide a valid checkpoint directory or omit --checkpoint_dir to use the base model only."
             )
             print(f"{'='*70}\n")
-            exit(1)
+            raise SystemExit(1)
+        args.checkpoint_dir = str(checkpoint_path)
+
+    base_model_path = resolve_path(args.base_model)
+    if not base_model_path.exists():
+        raise FileNotFoundError(
+            f"Base model does not exist: {base_model_path}. Run the matching prepare_model script first."
+        )
+    args.base_model = str(base_model_path)
 
     if args.top_p is None:
         args.top_p = 0.95 if args.enable_thinking else 0.8
@@ -675,7 +748,18 @@ def main():
             f"temp{args.temperature}",
             f"valn{args.val_n}",
         ]
-        args.output_file = str(Path("eval_results") / ("_".join(parts) + ".json"))
+        args.output_file = str(REPO_ROOT / "outputs" / "eval" / ("_".join(parts) + ".json"))
+
+    output_path = resolve_path(args.output_file)
+    args.output_file = str(output_path)
+    if is_complete_result(output_path, args):
+        existing = json.loads(output_path.read_text(encoding="utf-8"))
+        print(
+            f"Complete result already exists; skipping: {output_path}\n"
+            f"Pass@{args.val_n}: {existing['pass_at_n_pct']:.2f}% | "
+            f"Avg@{args.val_n}: {existing['average_at_n_pct']:.2f}%"
+        )
+        return
 
     print(f"Results will be saved to: {args.output_file}")
 
@@ -714,28 +798,19 @@ def main():
     # Setup LoRA request if checkpoint is provided
     lora_request = None
     if args.checkpoint_dir is not None:
-        try:
-            from vllm.lora.request import LoRARequest
+        from vllm.lora.request import LoRARequest
 
-            # Verify LoRA weights exist
-            adapter_safetensors = Path(args.checkpoint_dir) / "adapter_model.safetensors"
-            adapter_bin = Path(args.checkpoint_dir) / "adapter_model.bin"
-
-            if adapter_safetensors.exists() or adapter_bin.exists():
-                lora_request = LoRARequest("checkpoint_lora", 1, args.checkpoint_dir)
-                print(f"✓ Successfully created LoRA request for: {args.checkpoint_dir}")
-            else:
-                print(f"Warning: No LoRA adapter weights found at {args.checkpoint_dir}")
-                print("Expected 'adapter_model.safetensors' or 'adapter_model.bin'")
-                print("Continuing with base model only...")
-        except ImportError:
-            print("Warning: Could not import LoRARequest. Running without LoRA.")
-        except Exception as e:
-            print(f"Warning: Could not create LoRA request: {e}")
-            print("Continuing without LoRA.")
+        adapter_safetensors = Path(args.checkpoint_dir) / "adapter_model.safetensors"
+        adapter_bin = Path(args.checkpoint_dir) / "adapter_model.bin"
+        if not (adapter_safetensors.exists() or adapter_bin.exists()):
+            raise FileNotFoundError(
+                f"No LoRA adapter weights found at {args.checkpoint_dir}; refusing base-model fallback."
+            )
+        lora_request = LoRARequest("checkpoint_lora", 1, args.checkpoint_dir)
+        print(f"✓ Successfully created LoRA request for: {args.checkpoint_dir}")
 
     # Run evaluation
-    average_at_n_pct, results = evaluate_math500(
+    pass_at_n_pct, average_at_n_pct, results = evaluate_math(
         llm,
         tokenizer,
         max_new_tokens=args.max_new_tokens,
@@ -748,6 +823,7 @@ def main():
         output_file=args.output_file,
         lora_request=lora_request,
         dataset_name=args.dataset,
+        data_root=args.data_root,
         base_model_name=args.base_model,
         enable_thinking=args.enable_thinking,
         val_n=args.val_n,
@@ -756,6 +832,7 @@ def main():
     print("\n" + "=" * 70)
     print("EVALUATION COMPLETE!")
     print("=" * 70)
+    print(f"Final Pass@{args.val_n}: {pass_at_n_pct:.2f}%")
     print(f"Final Average@{args.val_n}: {average_at_n_pct:.2f}%")
     print(f"Results saved to: {args.output_file}")
     print("=" * 70 + "\n")

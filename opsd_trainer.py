@@ -161,6 +161,13 @@ class OPSDTrainer(SFTTrainer):
                 teacher_thinking=teacher_thinking,
             )
 
+        # OPSD uses a custom collator over the raw problem/solution columns.
+        # TRL's SFTTrainer otherwise tries to tokenize a non-existent `text`
+        # field and Transformers may remove these columns before collation.
+        args.dataset_kwargs = dict(args.dataset_kwargs or {})
+        args.dataset_kwargs["skip_prepare_dataset"] = True
+        args.remove_unused_columns = False
+
         super().__init__(
             model,
             args=args,

@@ -1,16 +1,25 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/common_env.sh"
+cd "$REPO_ROOT"
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
+
 accelerate launch \
-    --config_file accelerate.yaml \
-    --num_processes 4 \
-    --gradient_accumulation_steps 2 \
+    --config_file "$REPO_ROOT/accelerate.yaml" \
+    --num_processes 8 \
+    --gradient_accumulation_steps 1 \
     --main_process_port 12949 \
     opsd_train.py \
-    --model_name_or_path /data0/shared/Qwen3-1.7B \
+    --model_name_or_path "$REPO_ROOT/models/Qwen3-1.7B" \
+    --train_dataset_path "$REPO_ROOT/data/train/openthoughts_math_30k_opsd" \
     --learning_rate 5e-6 \
     --max_grad_norm 0.1 \
     --per_device_train_batch_size 4 \
     --gradient_checkpointing \
-    --gradient_accumulation_steps 2 \
-    --output_dir  /data0/siyanz/opsd/ \
+    --gradient_accumulation_steps 1 \
+    --output_dir "$REPO_ROOT/outputs/opsd" \
     --run_config qwen31b_gen1024_fixteacher_temp11_forwardbeta0_clip005 \
     --num_train_epochs 30 \
     --max_completion_length 1024 \
@@ -33,5 +42,13 @@ accelerate launch \
     --top_k 20 \
     --lmbda 1 \
     --fixed_teacher \
+    --student_thinking False \
+    --teacher_thinking True \
     --jsd_token_clip 0.05 \
-    --wandb_project OPSD
+    --wandb_project OPSD \
+    "$@"
+
+if [[ "${AUTO_EVAL:-1}" == "1" ]]; then
+    echo "Training complete; starting Qwen3-1.7B thinking-mode evaluation."
+    bash "$SCRIPT_DIR/run_eval_qwen3_1b.sh"
+fi

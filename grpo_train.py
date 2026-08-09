@@ -4,7 +4,6 @@ import re
 
 from math_verify import parse, verify
 
-from datasets import load_dataset
 from transformers import AutoTokenizer
 
 from trl import (
@@ -18,6 +17,7 @@ from trl import (
     get_quantization_config,
 )
 from dataclasses import dataclass, field
+from dataset_utils import load_local_parquet
 
 
 # Enable logging in a Hugging Face Space
@@ -35,6 +35,10 @@ class CustomScriptArguments(ScriptArguments):
             "(appended to output_dir) and WandB run name. If not specified, will generate "
             "automatic name based on hyperparameters."
         },
+    )
+    train_dataset_path: str = field(
+        default="data/train/openthoughts_math_30k_opsd",
+        metadata={"help": "Repository-relative path to the prepared OpenThoughts dataset."},
     )
     wandb_entity: str = field(
         default=None,
@@ -123,11 +127,11 @@ def make_format_prompt(tokenizer):
         messages = [
             {
                 "role": "user",
-                "content": f"Problem: {example['Question']}\nPlease reason step by step, and put your final answer within \\boxed{{}}.",
+                "content": f"Problem: {example['problem']}\nPlease reason step by step, and put your final answer within \\boxed{{}}.",
             }
         ]
         prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-        return {"prompt": prompt, "Answer": example["Answer"]}
+        return {"prompt": prompt, "Answer": example["solution"]}
 
     return format_prompt
 
@@ -271,8 +275,10 @@ if __name__ == "__main__":
     # Dataset
     ################
     # Load the math dataset with ground truth solutions
-    dataset = load_dataset("siyanzhao/Openthoughts_math_30k_opsd")
-    train_dataset = dataset["train"]
+    train_dataset = load_local_parquet(
+        script_args.train_dataset_path,
+        columns=["problem", "solution"],
+    )
 
     # Apply the format_prompt function to create the expected structure
     format_prompt = make_format_prompt(tokenizer)

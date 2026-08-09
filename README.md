@@ -27,16 +27,92 @@
 
 
 ```bash
-conda env create -f environment.yml
-conda activate opsd
-```
-
-```bash
-pip install flash-attn==2.8.3 --no-build-isolation
+bash scripts/setup_env.sh
+conda activate "$PWD/.cache/conda/opsd"
 ```
 If you encounter difficulties installing flash-attn, you can check the version matching your CUDA and PyTorch versions from the [flash-attention releases page](https://github.com/Dao-AILab/flash-attention/releases).
 
 The code uses `trl`'s experimental GOLD trainer as a base.
+
+## Portable 1-node reproduction
+
+The scripts below are designed for a fresh GitHub checkout. Dataset files,
+checkpoints, logs, and caches are kept under the repository root. Base-model
+weights remain in the Hugging Face cache and are exposed through links in
+`models/`.
+
+Create the pinned environment and prepare all datasets/models:
+
+```bash
+bash scripts/setup_env.sh
+conda activate "$PWD/.cache/conda/opsd"
+bash scripts/prepare_all.sh
+```
+
+The preparation scripts are idempotent. Each model can also be prepared
+independently:
+
+```bash
+bash scripts/prepare_model_qwen3_1b.sh
+bash scripts/prepare_model_qwen3_4b.sh
+bash scripts/prepare_model_qwen3_8b.sh
+```
+
+Run the paper's main OPSD configuration:
+
+```bash
+bash scripts/run_opsd_1b.sh --max_steps 100   # 8 GPUs, effective batch size 32
+bash scripts/run_opsd_4b.sh --max_steps 100   # 8 GPUs, effective batch size 32
+bash scripts/run_opsd_8b.sh --max_steps 100   # 8 GPUs, effective batch size 32
+```
+
+These scripts explicitly use the paper's main training modes: the student
+rollout is thinking-mode off and the privileged teacher is thinking-mode on.
+The model, optimizer, generation, and effective-batch settings are unchanged;
+the launch topology uses all 8 GPUs and preserves effective batch size 32.
+WandB defaults to offline mode for unattended runs; use `WANDB_MODE=online`
+when desired.
+
+After training exits successfully, each main `run_opsd_*.sh` launcher
+automatically starts its matching five-dataset thinking-mode evaluation. Set
+`AUTO_EVAL=0` to train without the post-training evaluation. Evaluation scope
+can be adjusted with `CHECKPOINTS`, `DATASETS`, `VAL_N`, and the variables
+shown below.
+
+Evaluate checkpoints 25/50/75/100 on AIME24, AIME25, BeyondAIME, HMMT25,
+and AMO-Bench:
+
+```bash
+bash scripts/run_eval_qwen3_1b.sh
+bash scripts/run_eval_qwen3_4b.sh
+bash scripts/run_eval_qwen3_8b.sh
+```
+
+Formal evaluation uses thinking mode, 16 samples per problem, temperature 1.0,
+top-p 0.95, disabled top-k, and 38,912 maximum new tokens. Detailed generations
+and aggregate `summary.json`/`summary.csv` files are written under
+`outputs/eval/<model>/`. `Pass@16` is the fraction of problems with at least one
+correct sample; `Avg@16` is accuracy over all 16 samples per problem.
+After all checkpoints finish, `best_by_dataset.json` and
+`best_by_dataset.csv` select the highest-Avg@16 checkpoint independently for
+each dataset and report the macro average, matching the paper's Table 2
+reporting convention.
+
+Long runs are resumable: completed result files are skipped. The evaluation
+scope can be narrowed without editing a script, for example:
+
+```bash
+CHECKPOINTS="25 100" DATASETS="aime24 beyond-aime" \
+    bash scripts/run_eval_qwen3_8b.sh
+```
+
+Set `HF_HOME` before model preparation if the target platform keeps its model
+cache on a dedicated volume. The resulting `models/Qwen3-*` links are checked
+before any download is attempted.
+
+The pinned PyTorch build uses CUDA 12.8. The NVIDIA driver may be newer, but
+the `nvcc` toolkit used to build DeepSpeed/FlashAttention extensions should be
+CUDA 12.8 as well; `setup_env.sh` prints a warning when it detects a mismatch.
 
 ## Repository Structure
 
@@ -48,17 +124,21 @@ The code uses `trl`'s experimental GOLD trainer as a base.
 ├── grpo_train.py            # GRPO baseline training entry point
 ├── accelerate.yaml          # Accelerate config (multi-GPU)
 ├── scripts/
-│   ├── run_opsd.sh          # Example launch script for OPSD
-│   ├── run_sft.sh           # Example launch script for SFT
-│   └── run_grpo.sh          # Example launch script for GRPO
+│   ├── prepare_all.sh       # Pinned local data + HF model links
+│   ├── run_opsd_*.sh       # Paper and ablation training launchers
+│   ├── run_eval_qwen3_*.sh # Five-dataset formal evaluation
+│   ├── run_sft.sh           # SFT baseline launcher
+│   └── run_grpo.sh          # GRPO baseline launcher
 └── eval/
     ├── evaluate_math.py     # Evaluation script (vLLM)
+    ├── run_model_eval.sh    # Model/checkpoint/dataset matrix runner
+    ├── summarize_results.py # JSON/CSV aggregate metrics
     └── run_eval.sh          # Example evaluation script
 ```
 
 ## Quick Start
 
-Reproduce results on Qwen3-1.7B (🚀 training only takes **~15 minutes** on 4×H100 and peaks within 100 steps):
+Reproduce results on Qwen3-1.7B with the portable single-node 8-GPU launcher:
 
 ```bash
 bash scripts/run_opsd_1b.sh

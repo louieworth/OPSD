@@ -1,3 +1,13 @@
 __pycache__/
 *.py[cod]
 *$py.class
+
+# Prepared by scripts/prepare_*.sh. Models are symlinks into the HF cache.
+data/
+models/
+
+# Repository-local runtime artifacts.
+outputs/
+.cache/
+wandb/
+eval_results/

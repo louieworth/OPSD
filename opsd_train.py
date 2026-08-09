@@ -1,7 +1,6 @@
 import os
 import wandb
 
-from datasets import load_dataset
 from transformers import AutoTokenizer, GenerationConfig
 
 from trl import (
@@ -16,6 +15,7 @@ from trl import (
 from trl.experimental.gold import GOLDConfig
 from opsd_trainer import OPSDTrainer
 from dataclasses import dataclass, field
+from dataset_utils import load_local_parquet
 
 # Enable logging in a Hugging Face Space
 os.environ.setdefault("TRACKIO_SPACE_ID", "trl-trackio")
@@ -30,6 +30,12 @@ class CustomScriptArguments(ScriptArguments):
         metadata={
             "help": "Use Thinking Machines style on-policy reverse KL loss instead of GKD's full-vocab JSD loss. "
             "This is much more memory efficient (O(1) vs O(vocab_size) per token)."
+        },
+    )
+    train_dataset_path: str = field(
+        default="data/train/openthoughts_math_30k_opsd",
+        metadata={
+            "help": "Repository-relative path to the prepared OpenThoughts Parquet dataset."
         },
     )
     fixed_teacher: bool = field(
@@ -263,8 +269,10 @@ if __name__ == "__main__":
     # Add presence_penalty to training_args so it can be accessed in the trainer
     training_args.presence_penalty = script_args.presence_penalty
 
-    dataset = load_dataset("siyanzhao/Openthoughts_math_30k_opsd")
-    train_dataset = dataset["train"]
+    train_dataset = load_local_parquet(
+        script_args.train_dataset_path,
+        columns=["problem", "solution"],
+    )
 
     trainer = OPSDTrainer(
         model=model_args.model_name_or_path,

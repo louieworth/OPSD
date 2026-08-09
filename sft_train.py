@@ -1,8 +1,9 @@
 import os
 import wandb
 
-from datasets import load_dataset
 from transformers import AutoTokenizer
+from dataclasses import dataclass, field
+from dataset_utils import load_local_parquet
 
 from trl import (
     SFTTrainer,
@@ -18,6 +19,14 @@ from trl import (
 
 # Enable logging in a Hugging Face Space
 os.environ.setdefault("TRACKIO_SPACE_ID", "trl-trackio")
+
+
+@dataclass
+class CustomScriptArguments(ScriptArguments):
+    train_dataset_path: str = field(
+        default="data/train/openthoughts_math_30k_opsd",
+        metadata={"help": "Repository-relative path to the prepared OpenThoughts dataset."},
+    )
 
 
 def make_format_fn(tokenizer):
@@ -44,7 +53,7 @@ def make_format_fn(tokenizer):
 
 
 if __name__ == "__main__":
-    parser = TrlParser((ScriptArguments, SFTConfig, ModelConfig))
+    parser = TrlParser((CustomScriptArguments, SFTConfig, ModelConfig))
     script_args, training_args, model_args = parser.parse_args_and_config()
 
     ################
@@ -128,8 +137,10 @@ if __name__ == "__main__":
     # Dataset
     ################
 
-    dataset = load_dataset("siyanzhao/Openthoughts_math_30k_opsd")
-    train_dataset = dataset["train"]
+    train_dataset = load_local_parquet(
+        script_args.train_dataset_path,
+        columns=["problem", "solution"],
+    )
     train_dataset = train_dataset.map(make_format_fn(tokenizer))
 
     # Take 1% of train for evaluation if no eval split exists
