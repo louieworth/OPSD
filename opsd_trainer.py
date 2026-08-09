@@ -29,6 +29,7 @@ from accelerate import PartialState
 from accelerate.utils import DistributedType, broadcast_object_list, gather_object, is_peft_model
 from datasets import Dataset, IterableDataset
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+from transformers import AutoModelForCausalLM
 from transformers.data.data_collator import DataCollator
 from transformers.feature_extraction_utils import FeatureExtractionMixin
 from transformers.generation.configuration_utils import GenerationConfig
@@ -144,7 +145,23 @@ class OPSDTrainer(SFTTrainer):
         ema_decay: float = 0.999,
         student_thinking: bool = False,
         teacher_thinking: bool = True,
+        alg: str = "opsd",
+        teacher_model: PreTrainedModel | nn.Module | str | None = None,
     ):
+        if alg not in {"opsd", "opd"}:
+            raise ValueError(f"Unsupported algorithm: {alg!r}. Expected 'opsd' or 'opd'.")
+        if alg == "opd" and teacher_model is None:
+            raise ValueError("OPD requires an external teacher_model.")
+        if alg == "opsd" and teacher_model is not None:
+            raise ValueError("OPSD uses the student as its teacher; teacher_model must be None.")
+        if alg == "opd" and reason_first:
+            raise ValueError("reason_first is only supported by OPSD because OPD has no privileged solution y*.")
+        if alg == "opd" and use_ema_teacher:
+            raise ValueError("use_ema_teacher is only supported by OPSD; the OPD teacher is external and fixed.")
+        if alg == "opd" and fixed_teacher:
+            raise ValueError("fixed_teacher is an OPSD option; the external OPD teacher is always fixed.")
+
+        self.alg = alg
         self.model_name_or_path = model if isinstance(model, str) else model.config._name_or_path
         self.model_revision = getattr(args, "student_model_revision", None)
         if isinstance(model, str) and self.model_revision is not None:
@@ -159,9 +176,10 @@ class OPSDTrainer(SFTTrainer):
                 reason_first=reason_first,
                 student_thinking=student_thinking,
                 teacher_thinking=teacher_thinking,
+                alg=alg,
             )
 
-        # OPSD uses a custom collator over the raw problem/solution columns.
+        # OPSD/OPD use a custom collator over the raw dataset columns.
         # TRL's SFTTrainer otherwise tries to tokenize a non-existent `text`
         # field and Transformers may remove these columns before collation.
         args.dataset_kwargs = dict(args.dataset_kwargs or {})
@@ -200,13 +218,13 @@ class OPSDTrainer(SFTTrainer):
         self._ema_params = None  # lazily initialized on first optimizer step
 
         # Validate fixed_teacher option
-        if self.fixed_teacher and peft_config is None:
+        if self.alg == "opsd" and self.fixed_teacher and peft_config is None:
             raise ValueError(
                 "fixed_teacher=True requires a PEFT config (use_peft=True). "
                 "The fixed teacher is implemented by disabling LoRA adapters during teacher forward passes."
             )
 
-        if self.use_ema_teacher and self.fixed_teacher:
+        if self.alg == "opsd" and self.use_ema_teacher and self.fixed_teacher:
             raise ValueError(
                 "use_ema_teacher=True and fixed_teacher=True are mutually exclusive teacher strategies."
             )
@@ -372,12 +390,42 @@ class OPSDTrainer(SFTTrainer):
 
             self.add_callback(GOLDVLLMSyncCallback(self))
 
+        self.teacher_model = None
+        if self.alg == "opd":
+            teacher_model_init_kwargs = dict(args.teacher_model_init_kwargs or {})
+            if not isinstance(teacher_model, str) and teacher_model_init_kwargs:
+                raise ValueError(
+                    "teacher_model_init_kwargs can only be used when teacher_model is a model path."
+                )
+            if isinstance(teacher_model, str):
+                teacher_model = AutoModelForCausalLM.from_pretrained(
+                    teacher_model, **teacher_model_init_kwargs
+                )
+            if teacher_model.config.vocab_size != self.model.config.vocab_size:
+                raise ValueError(
+                    "OPD requires student and teacher to share a vocabulary; got "
+                    f"{self.model.config.vocab_size} and {teacher_model.config.vocab_size}."
+                )
+            teacher_model.requires_grad_(False)
+            disable_dropout_in_model(teacher_model)
+            if self.is_deepspeed_enabled:
+                self.teacher_model = prepare_deepspeed(teacher_model, self.accelerator)
+            else:
+                self.teacher_model = self.accelerator.prepare_model(
+                    teacher_model, evaluation_mode=True
+                )
+            self.teacher_model.eval()
+            print(f"\n{'='*80}")
+            print("OPD EXTERNAL TEACHER ENABLED")
+            print(f"Teacher: {args.teacher_model_name_or_path}")
+            print("Teacher and student use the identical x prompt; no privileged solution y* is used.")
+            print(f"{'='*80}\n")
+
     def _set_signature_columns_if_needed(self):
         super()._set_signature_columns_if_needed()
-        required_columns = [
-            "problem",
-            "solution",
-        ]
+        required_columns = ["problem"]
+        if self.alg == "opsd":
+            required_columns.append("solution")
         if self._signature_columns is None:
             self._signature_columns = required_columns
         else:
@@ -676,21 +724,31 @@ class OPSDTrainer(SFTTrainer):
         empty_cache()
 
         # === TEACHER FORWARD - Extract log-probs immediately ===
-        # Choose teacher context based on mode:
+        # Choose teacher model/context based on mode:
+        #   OPD              → fixed external Qwen3-8B teacher
         #   use_ema_teacher  → swap in EMA weights temporarily
         #   fixed_teacher    → disable LoRA adapters (base model = initial policy)
         #   default (dynamic)→ no-op, use current student weights
-        if self.use_ema_teacher:
+        if self.alg == "opd":
+            teacher_forward_model = self.teacher_model
+            adapter_context = nullcontext()
+        elif self.use_ema_teacher:
+            teacher_forward_model = model
             adapter_context = self._ema_teacher_context(model)
         elif self.fixed_teacher and is_peft_model(model):
+            teacher_forward_model = model
             adapter_context = self.accelerator.unwrap_model(model).disable_adapter()
         else:
+            teacher_forward_model = model
             adapter_context = nullcontext()
 
         with torch.no_grad(), adapter_context:
-            outputs_teacher = model(
+            if self.alg == "opd":
+                teacher_forward_model.eval()
+            outputs_teacher = teacher_forward_model(
                 input_ids=inputs["teacher_input_ids"],
                 attention_mask=inputs["teacher_attention_mask"],
+                use_cache=False,
             )
 
             teacher_logits = outputs_teacher.logits[:, teacher_prompt_len - 1 : -1, :]

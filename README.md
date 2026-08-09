@@ -11,6 +11,11 @@
 
 **On-Policy Self-Distillation (OPSD)** trains a single model to act as both student and teacher by conditioning on different contexts — the student sees only the problem, while the teacher additionally sees the ground-truth solution — and performs token-level distribution matching along the student's own on-policy trajectories.
 
+This repository also supports **On-Policy Distillation (OPD)** through the same
+training entry point. OPD uses Qwen3-8B as a fixed external teacher and scores
+the student's on-policy completion with the same prompt and condition,
+\(\pi_T(y\mid x)\), without exposing the ground-truth solution to the teacher.
+
 
 ## Updates
 
@@ -58,21 +63,21 @@ bash scripts/prepare_data.sh
 All preparation commands are idempotent: existing files are validated against
 their pinned revisions, row counts, and required fields before downloading.
 
-The preparation scripts are idempotent. Each model can also be prepared
-independently:
+Model preparation defaults to all three models. A single model can also be
+selected with the positional model argument:
 
 ```bash
-bash scripts/prepare_model_qwen3_1b.sh
-bash scripts/prepare_model_qwen3_4b.sh
-bash scripts/prepare_model_qwen3_8b.sh
+bash scripts/prepare_models.sh 1.7b
+bash scripts/prepare_models.sh 4b
+bash scripts/prepare_models.sh 8b
 ```
 
 Run the paper's main OPSD configuration:
 
 ```bash
-bash scripts/run_opsd_1b.sh   # 8 GPUs, 100 steps, effective batch size 32
-bash scripts/run_opsd_4b.sh   # 8 GPUs, 100 steps, effective batch size 32
-bash scripts/run_opsd_8b.sh   # 8 GPUs, 100 steps, effective batch size 32
+bash scripts/OPSD/run_opsd_1b.sh   # 8 GPUs, 100 steps, effective batch size 32
+bash scripts/OPSD/run_opsd_4b.sh   # 8 GPUs, 100 steps, effective batch size 32
+bash scripts/OPSD/run_opsd_8b.sh   # 8 GPUs, 100 steps, effective batch size 32
 ```
 
 These scripts explicitly use the paper's main training modes: the student
@@ -81,6 +86,17 @@ The model, optimizer, generation, and effective-batch settings are unchanged;
 the launch topology uses all 8 GPUs and preserves effective batch size 32.
 WandB defaults to offline mode for unattended runs; use `WANDB_MODE=online`
 when desired.
+
+Run OPD with either supported student size:
+
+```bash
+bash scripts/OPD/run_opd_1b.sh   # Qwen3-1.7B student, Qwen3-8B teacher
+bash scripts/OPD/run_opd_4b.sh   # Qwen3-4B student, Qwen3-8B teacher
+```
+
+The optimization, generation, and colocated-vLLM settings mirror the
+corresponding OPSD launchers and target an 8×H100-80GB node. There is
+intentionally no Qwen3-8B OPD student launcher.
 
 After training exits successfully, each main `run_opsd_*.sh` launcher
 automatically starts its matching five-dataset thinking-mode evaluation. Set
@@ -92,18 +108,18 @@ Evaluate checkpoints 25/50/75/100 on AIME24, AIME25, BeyondAIME, HMMT25,
 and AMO-Bench:
 
 ```bash
-bash scripts/run_eval_qwen3_1b.sh
-bash scripts/run_eval_qwen3_4b.sh
-bash scripts/run_eval_qwen3_8b.sh
+bash scripts/run_eval.sh 1.7b
+bash scripts/run_eval.sh 4b
+bash scripts/run_eval.sh 8b
 ```
 
-Formal evaluation uses thinking mode, 16 samples per problem, temperature 1.0,
+Formal evaluation uses thinking mode, 12 samples per problem, temperature 1.0,
 top-p 0.95, disabled top-k, and 38,912 maximum new tokens. Detailed generations
 and aggregate `summary.json`/`summary.csv` files are written under
-`outputs/eval/<model>/`. `Pass@16` is the fraction of problems with at least one
-correct sample; `Avg@16` is accuracy over all 16 samples per problem.
+`outputs/eval/<model>/`. `Pass@12` is the fraction of problems with at least one
+correct sample; `Avg@12` is accuracy over all 12 samples per problem.
 After all checkpoints finish, `best_by_dataset.json` and
-`best_by_dataset.csv` select the highest-Avg@16 checkpoint independently for
+`best_by_dataset.csv` select the highest-Avg@12 checkpoint independently for
 each dataset and report the macro average, matching the paper's Table 2
 reporting convention.
 
@@ -112,7 +128,7 @@ scope can be narrowed without editing a script, for example:
 
 ```bash
 CHECKPOINTS="25 100" DATASETS="aime24 beyond-aime" \
-    bash scripts/run_eval_qwen3_8b.sh
+    bash scripts/run_eval.sh 8b
 ```
 
 Set `HF_HOME` before model preparation if the target platform keeps its model
@@ -134,8 +150,10 @@ CUDA 12.8 as well; `setup_env.sh` prints a warning when it detects a mismatch.
 ├── accelerate.yaml          # Accelerate config (multi-GPU)
 ├── scripts/
 │   ├── prepare_all.sh       # Pinned local data + HF model links
-│   ├── run_opsd_*.sh       # Paper and ablation training launchers
-│   ├── run_eval_qwen3_*.sh # Five-dataset formal evaluation
+│   ├── OPSD/               # OPSD launchers (1.7B, 4B, and 8B students)
+│   ├── OPD/                # OPD launchers (1.7B and 4B students; 8B teacher)
+│   ├── prepare_models.sh    # Prepare all models or one selected model
+│   ├── run_eval.sh          # Model-parameterized formal evaluation
 │   ├── run_sft.sh           # SFT baseline launcher
 │   └── run_grpo.sh          # GRPO baseline launcher
 └── eval/
@@ -150,7 +168,7 @@ CUDA 12.8 as well; `setup_env.sh` prints a warning when it detects a mismatch.
 Reproduce results on Qwen3-1.7B with the portable single-node 8-GPU launcher:
 
 ```bash
-bash scripts/run_opsd_1b.sh
+bash scripts/OPSD/run_opsd_1b.sh
 ```
 Evaluation: (evaluation takes ~ 30-50 minutes on 4xh100 for each checkpoint) 
 ```bash
@@ -365,10 +383,12 @@ bash run_eval_nonthink.sh
 
 
 
-## Key OPSD arguments
+## Key distillation arguments
 
 | Argument | Default | Description |
 |---|---|---|
+| `--alg` | `opsd` | Select `opsd` for the privileged self-teacher or `opd` for the fixed external Qwen3-8B teacher. OPD accepts only Qwen3-1.7B and Qwen3-4B students. |
+| `--teacher_model_name_or_path` | `models/Qwen3-8B` for OPD | External teacher used by OPD. Its architecture is validated as Qwen3-8B. This argument is rejected for OPSD. |
 | `--fixed_teacher` | `False` | Fix the teacher to the initial policy (step 0). Requires --use_peft. Note ❗ If you disable PEFT, the teacher will keep updating at every training step, which may make training unstable. Our main results use the fixed teacher, which is currently implemented with LoRA adapter weights. |
 | `--use_tinker_loss` | `False` | Use sampled-token policy-gradient objective instead of full-vocabulary JSD. More memory efficient. Currently no clipped implemented for this variant, could be unstable. |
 | `--max_completion_length` | — | Student generation length for distillation. We use 1024 in our main experiments. |

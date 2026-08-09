@@ -2,17 +2,19 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-source "$SCRIPT_DIR/common_env.sh"
+SCRIPTS_DIR="$(cd -- "$SCRIPT_DIR/.." && pwd)"
+source "$SCRIPTS_DIR/common_env.sh"
 cd "$REPO_ROOT"
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
 
 accelerate launch \
-    --config_file "$REPO_ROOT/accelerate.yaml" \
+    --config_file "${ACCELERATE_CONFIG_FILE:-$REPO_ROOT/accelerate.yaml}" \
     --num_processes 8 \
     --gradient_accumulation_steps 1 \
     --main_process_port 12949 \
     opsd_train.py \
-    --model_name_or_path "$REPO_ROOT/models/Qwen3-1.7B" \
+    --alg opsd \
+    --model_name_or_path "$REPO_ROOT/models/Qwen3-4B" \
     --train_dataset_path "$REPO_ROOT/data/train/openthoughts_math_30k_opsd" \
     --learning_rate 5e-6 \
     --max_grad_norm 0.1 \
@@ -20,7 +22,7 @@ accelerate launch \
     --gradient_checkpointing \
     --gradient_accumulation_steps 1 \
     --output_dir "$REPO_ROOT/outputs/opsd" \
-    --run_config qwen31b_gen1024_fixteacher_temp11_forwardbeta0_clip005 \
+    --run_config qwen34b_gen1024_fixteacher_temp11_forwardbeta0_clip005 \
     --max_steps 100 \
     --max_completion_length 1024 \
     --save_steps 25 \
@@ -49,6 +51,6 @@ accelerate launch \
     "$@"
 
 if [[ "${AUTO_EVAL:-1}" == "1" ]]; then
-    echo "Training complete; starting Qwen3-1.7B thinking-mode evaluation."
-    bash "$SCRIPT_DIR/run_eval_qwen3_1b.sh"
+    echo "Training complete; starting Qwen3-4B thinking-mode evaluation."
+    VAL_N="${VAL_N:-12}" bash "$SCRIPTS_DIR/run_eval.sh" 4b
 fi

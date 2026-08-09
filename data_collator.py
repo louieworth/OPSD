@@ -6,7 +6,8 @@ class SelfDistillationDataCollator:
     Data collator for self-distillation that creates both student and teacher inputs.
 
     Student: sees only the problem (with chat template)
-    Teacher: sees problem + solution + transition prompt (with chat template)
+    OPSD teacher: sees problem + solution + transition prompt
+    OPD teacher: sees the exact same problem prompt as the student
 
     To enable batch-level operations (like original GKD), we pad prompts to the same length
     within each batch, and track the actual (unpadded) prompt lengths for loss masking.
@@ -19,12 +20,16 @@ class SelfDistillationDataCollator:
         reason_first=True,
         student_thinking=False,
         teacher_thinking=True,
+        alg="opsd",
     ):
+        if alg not in {"opsd", "opd"}:
+            raise ValueError(f"Unsupported algorithm: {alg!r}. Expected 'opsd' or 'opd'.")
         self.tokenizer = tokenizer
         self.max_length = max_length
         self.reason_first = reason_first
         self.student_thinking = student_thinking
         self.teacher_thinking = teacher_thinking
+        self.alg = alg
 
         # Prompt for reasoning about the solution before teaching
         self.reason_first_prompt = (
@@ -58,11 +63,9 @@ class SelfDistillationDataCollator:
         teacher_reasoning_prompts = []  # NEW: for reason_first mode
 
         for feature in features:
-            # Extract problem and solution from dataset
-            # Handle different possible column names
+            # OPD datasets intentionally need only the problem column.
             problem = feature["problem"]
-            solution = feature["solution"]
-
+            solution = feature["solution"] if self.alg == "opsd" else None
             # Student prompt: just the problem with instruction (matching evaluation format)
             student_user_message = f"Problem: {problem}\n\nPlease reason step by step, and put your final answer within \\boxed{{}}."
             student_messages = [{"role": "user", "content": student_user_message}]
@@ -73,7 +76,12 @@ class SelfDistillationDataCollator:
             )
             student_prompts.append(student_prompt)
 
-            if self.reason_first:
+            if self.alg == "opd":
+                # OPD scores the student's on-policy completion with π_T(y|x).
+                # Reuse the exact rendered student prompt so the external teacher
+                # receives neither the reference solution nor a different condition.
+                teacher_prompts.append(student_prompt)
+            elif self.reason_first:
                 # Reasoning prompt: ask teacher to analyze the solution
                 reasoning_user_message = (
                     f"Problem: {problem}\n\n"
@@ -138,7 +146,18 @@ class SelfDistillationDataCollator:
             "student_prompt_lengths_per_example": torch.tensor(student_prompt_lengths),
         }
 
-        if self.reason_first:
+        if self.alg == "opd":
+            # Cloning makes the equality explicit while keeping the two batch fields
+            # independently movable/mutable by the trainer.
+            result.update(
+                {
+                    "teacher_prompts": student_encoded["input_ids"].clone(),
+                    "teacher_prompt_attention_mask": student_encoded["attention_mask"].clone(),
+                    "teacher_prompt_length": max_student_prompt_len,
+                    "teacher_prompt_lengths_per_example": torch.tensor(student_prompt_lengths),
+                }
+            )
+        elif self.reason_first:
             # Tokenize reasoning prompts
             reasoning_encoded_no_pad = self.tokenizer(
                 teacher_reasoning_prompts,

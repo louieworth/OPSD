@@ -695,7 +695,7 @@ def main():
         help="Maximum model context length (auto: 40960 for thinking, 32768 for non-thinking)",
     )
     parser.add_argument(
-        "--val_n", type=int, default=16, help="Number of solutions to sample per problem (default: 16)"
+        "--val_n", type=int, default=12, help="Number of solutions to sample per problem (default: 12)"
     )
 
     args = parser.parse_args()

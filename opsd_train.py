@@ -1,7 +1,7 @@
 import os
 import wandb
 
-from transformers import AutoTokenizer, GenerationConfig
+from transformers import AutoConfig, AutoTokenizer, GenerationConfig
 
 from trl import (
     LogCompletionsCallback,
@@ -25,6 +25,13 @@ os.environ.setdefault("TRACKIO_SPACE_ID", "trl-trackio")
 class CustomScriptArguments(ScriptArguments):
     """Extended script arguments with Thinking Machines loss option."""
 
+    alg: str = field(
+        default="opsd",
+        metadata={
+            "help": "Distillation algorithm: 'opsd' (privileged self-teacher) or "
+            "'opd' (external Qwen3-8B teacher)."
+        },
+    )
     use_tinker_loss: bool = field(
         default=False,
         metadata={
@@ -114,9 +121,67 @@ class CustomScriptArguments(ScriptArguments):
     )
 
 
+def validate_algorithm_config(script_args, training_args, model_args) -> None:
+    """Validate the model roles before allocating any model weights."""
+    if script_args.alg not in {"opsd", "opd"}:
+        raise ValueError(f"Unsupported --alg {script_args.alg!r}; expected 'opsd' or 'opd'.")
+
+    if script_args.alg == "opsd":
+        if training_args.teacher_model_name_or_path is not None:
+            raise ValueError("--teacher_model_name_or_path is only valid with --alg opd.")
+        return
+
+    if script_args.reason_first:
+        raise ValueError("--reason_first is incompatible with OPD because OPD does not use y*.")
+    if script_args.use_ema_teacher:
+        raise ValueError("--use_ema_teacher is only valid with --alg opsd.")
+    if script_args.fixed_teacher:
+        raise ValueError("--fixed_teacher is only valid with --alg opsd; the OPD teacher is always fixed.")
+
+    repo_root = os.path.dirname(os.path.abspath(__file__))
+    if training_args.teacher_model_name_or_path is None:
+        training_args.teacher_model_name_or_path = os.path.join(repo_root, "models", "Qwen3-8B")
+
+    config_kwargs = {
+        "revision": model_args.model_revision,
+        "trust_remote_code": model_args.trust_remote_code,
+    }
+    student_config = AutoConfig.from_pretrained(model_args.model_name_or_path, **config_kwargs)
+    teacher_config = AutoConfig.from_pretrained(training_args.teacher_model_name_or_path, **config_kwargs)
+
+    student_signature = (
+        student_config.model_type,
+        student_config.hidden_size,
+        student_config.num_hidden_layers,
+    )
+    allowed_students = {
+        ("qwen3", 2048, 28): "Qwen3-1.7B",
+        ("qwen3", 2560, 36): "Qwen3-4B",
+    }
+    if student_signature not in allowed_students:
+        raise ValueError(
+            "OPD supports only Qwen3-1.7B and Qwen3-4B students; got architecture "
+            f"{student_signature}."
+        )
+
+    teacher_signature = (
+        teacher_config.model_type,
+        teacher_config.hidden_size,
+        teacher_config.num_hidden_layers,
+    )
+    if teacher_signature != ("qwen3", 4096, 36):
+        raise ValueError(
+            "OPD requires a Qwen3-8B teacher; got architecture "
+            f"{teacher_signature}."
+        )
+    if student_config.vocab_size != teacher_config.vocab_size:
+        raise ValueError("The OPD student and teacher must use the same vocabulary.")
+
+
 if __name__ == "__main__":
     parser = TrlParser((CustomScriptArguments, GOLDConfig, ModelConfig))
     script_args, training_args, model_args = parser.parse_args_and_config()
+    validate_algorithm_config(script_args, training_args, model_args)
 
     ################
     # WandB Run Name & Output Directory
@@ -146,7 +211,7 @@ if __name__ == "__main__":
 
         # Create concise run name
         full_wandb_run_config = (
-            f"opsd_{model_name}_"
+            f"{script_args.alg}_{model_name}_"
             f"lr{lr_str}_"
             f"bs{effective_batch_size}_"
             f"tok{training_args.max_completion_length}"
@@ -181,6 +246,8 @@ if __name__ == "__main__":
             name=full_wandb_run_config,
             config={
                 "model_name": model_args.model_name_or_path,
+                "alg": script_args.alg,
+                "teacher_model_name_or_path": training_args.teacher_model_name_or_path,
                 "learning_rate": training_args.learning_rate,
                 "per_device_train_batch_size": training_args.per_device_train_batch_size,
                 "gradient_accumulation_steps": training_args.gradient_accumulation_steps,
@@ -248,7 +315,14 @@ if __name__ == "__main__":
 
     training_args.model_init_kwargs = model_kwargs
 
-    # No separate teacher model needed - we use the same model with privileged info
+    if script_args.alg == "opd":
+        training_args.teacher_model_init_kwargs = dict(
+            revision=model_args.model_revision,
+            trust_remote_code=model_args.trust_remote_code,
+            attn_implementation=model_args.attn_implementation or "flash_attention_2",
+            torch_dtype=model_dtype,
+            use_cache=False,
+        )
 
     tokenizer = AutoTokenizer.from_pretrained(
         model_args.model_name_or_path,
@@ -262,7 +336,7 @@ if __name__ == "__main__":
     ################
     # Dataset
     ################
-    # Load the math dataset with ground truth solutions
+    # OPSD loads reference solutions; OPD intentionally loads problems only.
     ################
     # Training
     ################
@@ -271,7 +345,7 @@ if __name__ == "__main__":
 
     train_dataset = load_local_parquet(
         script_args.train_dataset_path,
-        columns=["problem", "solution"],
+        columns=["problem", "solution"] if script_args.alg == "opsd" else ["problem"],
     )
 
     trainer = OPSDTrainer(
@@ -290,6 +364,10 @@ if __name__ == "__main__":
         ema_decay=script_args.ema_decay,
         student_thinking=script_args.student_thinking,
         teacher_thinking=script_args.teacher_thinking,
+        alg=script_args.alg,
+        teacher_model=(
+            training_args.teacher_model_name_or_path if script_args.alg == "opd" else None
+        ),
     )
 
     if training_args.eval_strategy != "no":

@@ -1,9 +1,0 @@
-#!/usr/bin/env bash
-set -euo pipefail
-
-SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-python "$SCRIPT_DIR/prepare_model.py" \
-    --repo-id Qwen/Qwen3-1.7B \
-    --revision 70d244cc86ccca08cf5af4e1e306ecf908b1ad5e \
-    --link-name Qwen3-1.7B
-
