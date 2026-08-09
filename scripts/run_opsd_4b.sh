@@ -21,7 +21,7 @@ accelerate launch \
     --gradient_accumulation_steps 1 \
     --output_dir "$REPO_ROOT/outputs/opsd" \
     --run_config qwen34b_gen1024_fixteacher_temp11_forwardbeta0_clip005 \
-    --num_train_epochs 30 \
+    --max_steps 100 \
     --max_completion_length 1024 \
     --save_steps 25 \
     --logging_steps 2 \

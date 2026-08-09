@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import argparse
 import json
 from pathlib import Path
 
@@ -14,7 +15,18 @@ DATASETS = {
     "train/openthoughts_math_30k_opsd": {
         "repo_id": "siyanzhao/Openthoughts_math_30k_opsd",
         "revision": "1f33e9dc2e8a1c639ca74f8024ad4a9f1f5eae62",
-        "files": ["data/train-00000-of-00002.parquet", "data/train-00001-of-00002.parquet"],
+        "source_files": [
+            "data/train-00000-of-00002.parquet",
+            "data/train-00001-of-00002.parquet",
+        ],
+        "files": [
+            "data/train-00000-of-00004.parquet",
+            "data/train-00001-of-00004.parquet",
+            "data/train-00002-of-00004.parquet",
+            "data/train-00003-of-00004.parquet",
+        ],
+        "row_groups_per_file": 2,
+        "max_file_bytes": 100_000_000,
         "rows": 29434,
         "fields": ["problem", "solution"],
     },
@@ -56,6 +68,46 @@ DATASETS = {
 }
 
 
+def reshard_parquet(root: Path, spec: dict) -> None:
+    """Convert the two upstream shards into GitHub-safe local shards."""
+    source_paths = [root / relative for relative in spec["source_files"]]
+    output_paths = [root / relative for relative in spec["files"]]
+    row_groups = []
+    schema = None
+    for source_path in source_paths:
+        parquet_file = pq.ParquetFile(source_path)
+        schema = schema or parquet_file.schema_arrow
+        if parquet_file.schema_arrow != schema:
+            raise RuntimeError(f"Parquet schema mismatch in {source_path}")
+        row_groups.extend(
+            (parquet_file, index) for index in range(parquet_file.metadata.num_row_groups)
+        )
+
+    groups_per_file = spec["row_groups_per_file"]
+    if len(row_groups) != len(output_paths) * groups_per_file:
+        raise RuntimeError(
+            f"Expected {len(output_paths) * groups_per_file} row groups, found {len(row_groups)}"
+        )
+
+    for output_index, output_path in enumerate(output_paths):
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        temporary_path = output_path.with_suffix(output_path.suffix + ".tmp")
+        with pq.ParquetWriter(temporary_path, schema, compression="snappy") as writer:
+            begin = output_index * groups_per_file
+            for parquet_file, row_group_index in row_groups[begin : begin + groups_per_file]:
+                writer.write_table(parquet_file.read_row_group(row_group_index))
+        if temporary_path.stat().st_size >= spec["max_file_bytes"]:
+            raise RuntimeError(
+                f"Resharded file exceeds GitHub's 100 MB limit: {temporary_path} "
+                f"({temporary_path.stat().st_size} bytes)"
+            )
+        temporary_path.replace(output_path)
+
+    validate_dataset(root, spec)
+    for source_path in source_paths:
+        source_path.unlink()
+
+
 def validate_dataset(root: Path, spec: dict) -> None:
     rows = 0
     available_fields: set[str] = set()
@@ -76,6 +128,17 @@ def validate_dataset(root: Path, spec: dict) -> None:
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Download and validate pinned OPSD train/evaluation datasets."
+    )
+    parser.add_argument(
+        "--scope",
+        choices=["all", "train", "eval"],
+        default="all",
+        help="Prepare all datasets, only training data, or only evaluation data.",
+    )
+    args = parser.parse_args()
+
     repo_root = Path(__file__).resolve().parents[1]
     data_root = repo_root / "data"
     data_root.mkdir(parents=True, exist_ok=True)
@@ -86,8 +149,12 @@ def main() -> None:
     except (FileNotFoundError, json.JSONDecodeError):
         existing_manifest = {}
 
-    manifest = {}
+    manifest = dict(existing_manifest)
     for relative_dir, spec in DATASETS.items():
+        dataset_scope = relative_dir.split("/", 1)[0]
+        if args.scope != "all" and dataset_scope != args.scope:
+            continue
+
         destination = data_root / relative_dir
         existing = existing_manifest.get(relative_dir, {})
         if existing.get("revision") == spec["revision"]:
@@ -98,10 +165,10 @@ def main() -> None:
                 existing = {}
 
         if existing.get("revision") != spec["revision"]:
-            allow_patterns = list(spec["files"]) + [
+            download_files = spec.get("source_files", spec["files"])
+            allow_patterns = list(download_files) + [
                 "README.md",
                 "LICENSE",
-                ".gitattributes",
                 "eval.yaml",
             ]
             print(f"Preparing {spec['repo_id']}@{spec['revision']} in {destination}")
@@ -112,6 +179,8 @@ def main() -> None:
                 local_dir=destination,
                 allow_patterns=allow_patterns,
             )
+            if "source_files" in spec:
+                reshard_parquet(destination, spec)
             validate_dataset(destination, spec)
             print(f"Validated {relative_dir}: {spec['rows']} rows")
 
@@ -123,7 +192,7 @@ def main() -> None:
         }
 
     manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    print(f"Wrote dataset manifest: {manifest_path}")
+    print(f"Wrote dataset manifest: {manifest_path} (scope={args.scope})")
 
 
 if __name__ == "__main__":

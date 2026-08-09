@@ -36,18 +36,27 @@ The code uses `trl`'s experimental GOLD trainer as a base.
 
 ## Portable 1-node reproduction
 
-The scripts below are designed for a fresh GitHub checkout. Dataset files,
-checkpoints, logs, and caches are kept under the repository root. Base-model
-weights remain in the Hugging Face cache and are exposed through links in
-`models/`.
+The scripts below are designed for a fresh GitHub checkout. Prepared datasets,
+checkpoints, logs, and caches stay below the repository root. Base-model weights
+remain in the Hugging Face cache and are exposed through links in `models/`.
 
-Create the pinned environment and prepare all datasets/models:
+When the target platform already provides the environment, prepare the pinned
+training data, five evaluation datasets, and Hugging Face model links:
 
 ```bash
-bash scripts/setup_env.sh
-conda activate "$PWD/.cache/conda/opsd"
-bash scripts/prepare_all.sh
+bash scripts/prepare_train_data.sh
+bash scripts/prepare_eval_data.sh
+bash scripts/prepare_models.sh
 ```
+
+The combined data command is equivalent and prepares both scopes:
+
+```bash
+bash scripts/prepare_data.sh
+```
+
+All preparation commands are idempotent: existing files are validated against
+their pinned revisions, row counts, and required fields before downloading.
 
 The preparation scripts are idempotent. Each model can also be prepared
 independently:
@@ -61,9 +70,9 @@ bash scripts/prepare_model_qwen3_8b.sh
 Run the paper's main OPSD configuration:
 
 ```bash
-bash scripts/run_opsd_1b.sh --max_steps 100   # 8 GPUs, effective batch size 32
-bash scripts/run_opsd_4b.sh --max_steps 100   # 8 GPUs, effective batch size 32
-bash scripts/run_opsd_8b.sh --max_steps 100   # 8 GPUs, effective batch size 32
+bash scripts/run_opsd_1b.sh   # 8 GPUs, 100 steps, effective batch size 32
+bash scripts/run_opsd_4b.sh   # 8 GPUs, 100 steps, effective batch size 32
+bash scripts/run_opsd_8b.sh   # 8 GPUs, 100 steps, effective batch size 32
 ```
 
 These scripts explicitly use the paper's main training modes: the student

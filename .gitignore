@@ -2,8 +2,10 @@ __pycache__/
 *.py[cod]
 *$py.class
 
-# Prepared by scripts/prepare_*.sh. Models are symlinks into the HF cache.
+# Prepared data is downloaded by scripts/prepare_*_data.sh.
 data/
+
+# Base models are symlinks into the Hugging Face cache.
 models/
 
 # Repository-local runtime artifacts.
