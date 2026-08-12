@@ -43,8 +43,8 @@ case "$model" in
         ;;
 esac
 
-export GPU_IDS="${GPU_IDS:-0,1,2,3}"
-TP_SIZE="${TP_SIZE:-4}"
+export GPU_IDS="${GPU_IDS:-0,1,2,3,4,5,6,7}"
+TP_SIZE="${TP_SIZE:-8}"
 
 bash "$REPO_ROOT/eval/run_model_eval.sh" \
     "$model_path" \
