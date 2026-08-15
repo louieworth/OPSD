@@ -14,7 +14,10 @@ TRD_REFINEMENT_HOST="${TRD_REFINEMENT_HOST:-127.0.0.1}"
 TRD_REFINEMENT_PORT="${TRD_REFINEMENT_PORT:-8002}"
 TRD_REFINEMENT_CONNECT_TIMEOUT="${TRD_REFINEMENT_CONNECT_TIMEOUT:-10}"
 TRD_REFINEMENT_REQUEST_TIMEOUT="${TRD_REFINEMENT_REQUEST_TIMEOUT:-1800}"
-TRD_REFINEMENT_MAX_MODEL_LEN="${TRD_REFINEMENT_MAX_MODEL_LEN:-20000}"
+# The default is source-specific and is resolved inside trd_launch:
+# OPSD keeps a 20,000-token refinement prefix plus the y_r reserve, while
+# OPD retains the existing 20,000-token total context.
+TRD_REFINEMENT_MAX_MODEL_LEN="${TRD_REFINEMENT_MAX_MODEL_LEN:-}"
 TRD_SERVER_STARTUP_TIMEOUT="${TRD_SERVER_STARTUP_TIMEOUT:-900}"
 TRD_TEACHER_GPU_MEMORY_UTILIZATION="${TRD_TEACHER_GPU_MEMORY_UTILIZATION:-0.9}"
 TRD_SERVER_LOG_DIR="${TRD_SERVER_LOG_DIR:-$REPO_ROOT/outputs/trd/server-logs}"
@@ -218,6 +221,7 @@ trd_install_cleanup_traps() {
 trd_start_teacher_server() {
     local teacher_model="$1"
     local run_name="$2"
+    local refinement_max_model_len="$3"
     local safe_run_name="${run_name//\//_}"
     local startup_start world_size
 
@@ -227,7 +231,7 @@ trd_start_teacher_server() {
     trd_require_command setsid
     trd_validate_gpu_topology
     trd_validate_positive_integer TRD_REFINEMENT_PORT "$TRD_REFINEMENT_PORT"
-    trd_validate_positive_integer TRD_REFINEMENT_MAX_MODEL_LEN "$TRD_REFINEMENT_MAX_MODEL_LEN"
+    trd_validate_positive_integer TRD_REFINEMENT_MAX_MODEL_LEN "$refinement_max_model_len"
     trd_validate_positive_integer TRD_SERVER_STARTUP_TIMEOUT "$TRD_SERVER_STARTUP_TIMEOUT"
     trd_assert_port_free
 
@@ -245,7 +249,7 @@ trd_start_teacher_server() {
         --data_parallel_size 1 \
         --gpu_memory_utilization "$TRD_TEACHER_GPU_MEMORY_UTILIZATION" \
         --dtype bfloat16 \
-        --max_model_len "$TRD_REFINEMENT_MAX_MODEL_LEN" \
+        --max_model_len "$refinement_max_model_len" \
         > "$TRD_TEACHER_SERVER_LOG" 2>&1 &
     TRD_TEACHER_SERVER_PID=$!
 
@@ -339,6 +343,9 @@ trd_launch() {
     local policy_updates="${TRD_POLICY_GRADIENT_UPDATES:-100}"
     local completion_length="${TRD_MAX_COMPLETION_LENGTH:-1024}"
     local refinement_length="${TRD_MAX_REFINEMENT_LENGTH:-1024}"
+    local training_max_length
+    local refinement_max_model_len
+    local student_response_reserve
     local save_steps
     local run_config
     local output_root
@@ -348,10 +355,38 @@ trd_launch() {
     trd_validate_positive_integer TRD_POLICY_GRADIENT_UPDATES "$policy_updates"
     trd_validate_positive_integer TRD_MAX_COMPLETION_LENGTH "$completion_length"
     trd_validate_positive_integer TRD_MAX_REFINEMENT_LENGTH "$refinement_length"
+    student_response_reserve="$completion_length"
+    if (( refinement_length > student_response_reserve )); then
+        student_response_reserve="$refinement_length"
+    fi
+
+    case "$algorithm" in
+        opsd)
+            # Preserve a full 20,000-token prompt on both paths, then add the
+            # relevant response reserve to obtain each total context length.
+            training_max_length="${TRD_MAX_LENGTH:-$((20000 + student_response_reserve))}"
+            refinement_max_model_len="${TRD_REFINEMENT_MAX_MODEL_LEN:-$((20000 + refinement_length))}"
+            ;;
+        opd)
+            training_max_length="${TRD_MAX_LENGTH:-20000}"
+            refinement_max_model_len="${TRD_REFINEMENT_MAX_MODEL_LEN:-20000}"
+            ;;
+        *)
+            trd_die "unsupported algorithm: $algorithm"
+            return 1
+            ;;
+    esac
+
+    trd_validate_positive_integer TRD_MAX_LENGTH "$training_max_length"
+    trd_validate_positive_integer TRD_REFINEMENT_MAX_MODEL_LEN "$refinement_max_model_len"
+    if (( student_response_reserve >= training_max_length )); then
+        trd_die "TRD_MAX_LENGTH must leave room for the larger of y_o and y_r"
+        return 1
+    fi
     if (( policy_updates > rollout_steps || rollout_steps % policy_updates != 0 )); then
         trd_die "TRD_POLICY_GRADIENT_UPDATES must divide TRD_MAX_STEPS and cannot exceed it"
     fi
-    if (( refinement_length >= TRD_REFINEMENT_MAX_MODEL_LEN )); then
+    if (( refinement_length >= refinement_max_model_len )); then
         trd_die "TRD_MAX_REFINEMENT_LENGTH must be smaller than TRD_REFINEMENT_MAX_MODEL_LEN"
     fi
     if [[ "${DISTILL_DRY_RUN:-0}" != "1" ]]; then
@@ -411,7 +446,7 @@ trd_launch() {
         --logging_steps "${TRD_LOGGING_STEPS:-2}"
         --attn_implementation flash_attention_2
         --torch_dtype bfloat16
-        --max_length "${TRD_MAX_LENGTH:-20000}"
+        --max_length "$training_max_length"
         --beta 0
         --distillation_temperature 1.0
         --top_k_loss 0
@@ -435,7 +470,7 @@ trd_launch() {
         --refinement_vllm_server_port "$TRD_REFINEMENT_PORT"
         --refinement_vllm_connect_timeout "$TRD_REFINEMENT_CONNECT_TIMEOUT"
         --refinement_vllm_request_timeout "$TRD_REFINEMENT_REQUEST_TIMEOUT"
-        --refinement_vllm_max_model_len "$TRD_REFINEMENT_MAX_MODEL_LEN"
+        --refinement_vllm_max_model_len "$refinement_max_model_len"
         --wandb_project TRD
         "${algorithm_args[@]}"
         "${extra_training_args[@]}"
@@ -455,7 +490,7 @@ trd_launch() {
     fi
 
     trd_install_cleanup_traps
-    trd_start_teacher_server "$refiner_model" "$run_config"
+    trd_start_teacher_server "$refiner_model" "$run_config" "$refinement_max_model_len"
 
     trd_run_training "${training_command[@]}"
 

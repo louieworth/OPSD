@@ -116,7 +116,7 @@ class AlgorithmConfigTests(unittest.TestCase):
             "distillation_temperature": None,
             "use_ema_teacher": False,
             "max_refinement_length": None,
-            "refinement_vllm_max_model_len": 20_000,
+            "refinement_vllm_max_model_len": None,
             "fixed_teacher": True,
         }
         values.update(overrides)
@@ -138,12 +138,135 @@ class AlgorithmConfigTests(unittest.TestCase):
 
         self.assertEqual(script_args.distillation_temperature, 1.0)
         self.assertEqual(script_args.max_refinement_length, 1_024)
+        self.assertEqual(script_args.refinement_vllm_max_model_len, 21_024)
 
     def test_trd_rejects_non_unit_distillation_temperature(self):
         script_args = self.trd_args(distillation_temperature=0.9)
 
         with self.assertRaisesRegex(ValueError, "requires --distillation_temperature 1.0"):
             validate_algorithm_config(script_args, self.training_args(), SimpleNamespace())
+
+
+class TRDLengthBudgetTests(unittest.TestCase):
+    class StopAfterBaseTrainerInit(Exception):
+        pass
+
+    class TokenizedPrompts:
+        def __init__(self, input_ids):
+            self.input_ids = input_ids
+
+        def to(self, _device):
+            return self
+
+    class CapturingTokenizer:
+        pad_token = None
+        pad_token_id = 0
+
+        def __init__(self):
+            self.max_length = None
+
+        def batch_decode(self, token_ids, *, skip_special_tokens):
+            del skip_special_tokens
+            return ["p" * 21_024 for _ in token_ids]
+
+        def __call__(self, prompts, **kwargs):
+            self.max_length = kwargs["max_length"]
+            return TRDLengthBudgetTests.TokenizedPrompts(
+                torch.ones((len(prompts), self.max_length), dtype=torch.long)
+            )
+
+        def decode(self, token_ids, *, skip_special_tokens):
+            del skip_special_tokens
+            return "/".join(map(str, token_ids))
+
+    def test_teacher_refine_reserves_larger_student_response_budget(self):
+        cases = (
+            (1_024, 1_024),
+            (512, 1_024),
+            (1_024, 512),
+        )
+        for max_completion_length, max_refinement_length in cases:
+            with self.subTest(
+                max_completion_length=max_completion_length,
+                max_refinement_length=max_refinement_length,
+            ):
+                trainer = OPSDTrainer.__new__(OPSDTrainer)
+                args = SimpleNamespace(
+                    max_length=21_024,
+                    max_completion_length=max_completion_length,
+                    student_model_revision=None,
+                    dataset_kwargs=None,
+                )
+                model = SimpleNamespace(config=SimpleNamespace(_name_or_path="student"))
+                collator = object()
+
+                with patch(
+                    "opsd_trainer.SelfDistillationDataCollator", return_value=collator
+                ) as collator_factory, patch.object(
+                    SFTTrainer,
+                    "__init__",
+                    side_effect=self.StopAfterBaseTrainerInit,
+                ), self.assertRaises(self.StopAfterBaseTrainerInit):
+                    OPSDTrainer.__init__(
+                        trainer,
+                        model=model,
+                        args=args,
+                        processing_class=object(),
+                        teacher_refine=True,
+                        max_refinement_length=max_refinement_length,
+                        refinement_vllm_max_model_len=21_024,
+                    )
+
+                expected_prompt_cap = 21_024 - max(
+                    max_completion_length, max_refinement_length
+                )
+                self.assertEqual(trainer.student_prompt_max_length, expected_prompt_cap)
+                self.assertEqual(
+                    trainer.refinement_prompt_max_length,
+                    21_024 - max_refinement_length,
+                )
+                collator_factory.assert_called_once()
+                self.assertEqual(
+                    collator_factory.call_args.kwargs["max_length"], expected_prompt_cap
+                )
+
+    @patch("opsd_trainer.broadcast_object_list")
+    @patch("opsd_trainer.gather_object", side_effect=lambda values: values)
+    def test_vllm_retokenization_keeps_larger_refinement_reserve(
+        self, _gather, _broadcast
+    ):
+        tokenizer = self.CapturingTokenizer()
+        trainer = OPSDTrainer.__new__(OPSDTrainer)
+        trainer.teacher_refine = True
+        trainer.student_prompt_max_length = 20_000
+        trainer.processing_class = tokenizer
+        trainer.accelerator = SimpleNamespace(
+            device=torch.device("cpu"), is_main_process=True, process_index=0
+        )
+        trainer.vllm_mode = "server"
+        trainer.vllm_guided_decoding_regex = None
+        trainer.vllm_client = SimpleNamespace(
+            generate=lambda **kwargs: {
+                "completion_ids": [[7] for _ in kwargs["prompts"]]
+            }
+        )
+        trainer.args = SimpleNamespace(max_length=21_024)
+        generation_config = SimpleNamespace(
+            max_new_tokens=512,
+            temperature=1.0,
+            top_k=0,
+        )
+
+        with patch("builtins.print"):
+            generated_ids, *_ = OPSDTrainer._generate_on_policy_outputs_vllm.__wrapped__(
+                trainer,
+                {"student_prompts": torch.tensor([[1]])},
+                generation_config,
+                pad_token_id=0,
+            )
+
+        self.assertEqual(tokenizer.max_length, 20_000)
+        self.assertEqual(generated_ids.shape[1], 20_000 + 512)
 
 
 class WindowDataCollatorTests(unittest.TestCase):
@@ -205,6 +328,8 @@ class DistillationBatchTests(unittest.TestCase):
     def setUp(self):
         self.trainer = OPSDTrainer.__new__(OPSDTrainer)
         self.trainer.processing_class = SimpleNamespace(pad_token_id=0)
+        self.trainer.student_context_max_length = 21_024
+        self.trainer.refinement_vllm_max_model_len = 21_024
         self.rollout = {
             "inputs": {
                 "student_prompts": torch.tensor([[1, 2, 0], [3, 4, 5]]),
@@ -267,6 +392,73 @@ class DistillationBatchTests(unittest.TestCase):
             batch["labels"],
             torch.tensor([[-100, -100, -100, 20, 21], [-100, -100, -100, 30, -100]]),
         )
+
+    def test_trd_kl_inputs_fit_exact_student_and_teacher_context_caps(self):
+        prompt_length = 20_000
+        refinement_length = 1_024
+        rollout = {
+            "inputs": {
+                "student_prompts": torch.full((1, prompt_length), 1),
+                "student_prompt_attention_mask": torch.ones(
+                    (1, prompt_length), dtype=torch.long
+                ),
+                "teacher_prompts": torch.tensor([[9]]),
+                "teacher_prompt_attention_mask": torch.ones((1, 1), dtype=torch.long),
+            }
+        }
+
+        batch = self.trainer._build_distillation_batch(
+            rollout,
+            target_ids=[[3] * refinement_length],
+            teacher_prompt_ids=[[2] * prompt_length],
+        )
+
+        self.assertEqual(batch["student_input_ids"].shape[1], 21_024)
+        self.assertEqual(batch["teacher_input_ids"].shape[1], 21_024)
+        self.assertLessEqual(
+            batch["student_input_ids"].shape[1],
+            self.trainer.student_context_max_length,
+        )
+        self.assertLessEqual(
+            batch["teacher_input_ids"].shape[1],
+            self.trainer.refinement_vllm_max_model_len,
+        )
+
+    def test_trd_kl_inputs_reject_one_token_context_overflow(self):
+        refinement_ids = [[3] * 1_024]
+        overflowing_prompt = [2] * 20_001
+
+        student_overflow_rollout = {
+            "inputs": {
+                "student_prompts": torch.full((1, 20_001), 1),
+                "student_prompt_attention_mask": torch.ones(
+                    (1, 20_001), dtype=torch.long
+                ),
+                "teacher_prompts": torch.tensor([[9]]),
+                "teacher_prompt_attention_mask": torch.ones((1, 1), dtype=torch.long),
+            }
+        }
+        with self.assertRaisesRegex(RuntimeError, "student KL sequence"):
+            self.trainer._build_distillation_batch(
+                student_overflow_rollout,
+                target_ids=refinement_ids,
+                teacher_prompt_ids=[[2]],
+            )
+
+        teacher_overflow_rollout = {
+            "inputs": {
+                "student_prompts": torch.tensor([[1]]),
+                "student_prompt_attention_mask": torch.ones((1, 1), dtype=torch.long),
+                "teacher_prompts": torch.tensor([[9]]),
+                "teacher_prompt_attention_mask": torch.ones((1, 1), dtype=torch.long),
+            }
+        }
+        with self.assertRaisesRegex(RuntimeError, "teacher KL sequence"):
+            self.trainer._build_distillation_batch(
+                teacher_overflow_rollout,
+                target_ids=refinement_ids,
+                teacher_prompt_ids=[overflowing_prompt],
+            )
 
     def test_rejects_empty_target_batches_or_rows(self):
         for target_ids in ([], [[20], []]):

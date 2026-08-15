@@ -159,9 +159,12 @@ class CustomScriptArguments(ScriptArguments):
         default=1800.0,
         metadata={"help": "Teacher vLLM generation read timeout in seconds."},
     )
-    refinement_vllm_max_model_len: int = field(
-        default=20000,
-        metadata={"help": "Context limit configured on the teacher vLLM service."},
+    refinement_vllm_max_model_len: int | None = field(
+        default=None,
+        metadata={
+            "help": "Context limit configured on the teacher vLLM service. Defaults to 21,024 for "
+            "OPSD TRD (20,000-token prompt + 1,024-token y_r) and 20,000 for OPD TRD."
+        },
     )
 
 
@@ -191,6 +194,12 @@ def validate_algorithm_config(script_args, training_args, model_args) -> None:
             script_args.max_refinement_length = training_args.max_completion_length
         if script_args.max_refinement_length <= 0:
             raise ValueError("--max_refinement_length must be positive.")
+        if script_args.refinement_vllm_max_model_len is None:
+            script_args.refinement_vllm_max_model_len = (
+                20_000 + script_args.max_refinement_length
+                if script_args.alg == "opsd"
+                else 20_000
+            )
         if script_args.refinement_vllm_max_model_len <= script_args.max_refinement_length:
             raise ValueError(
                 "--refinement_vllm_max_model_len must be larger than --max_refinement_length."
@@ -411,6 +420,23 @@ if __name__ == "__main__":
                 "fixed_teacher": script_args.fixed_teacher,
                 "teacher_refine": script_args.teacher_refine,
                 "max_refinement_length": script_args.max_refinement_length,
+                "student_prompt_max_length": (
+                    training_args.max_length
+                    - max(
+                        training_args.max_completion_length,
+                        script_args.max_refinement_length
+                        or training_args.max_completion_length,
+                    )
+                    if script_args.teacher_refine
+                    else training_args.max_length
+                ),
+                "refinement_prompt_max_length": (
+                    script_args.refinement_vllm_max_model_len
+                    - (script_args.max_refinement_length or training_args.max_completion_length)
+                    if script_args.teacher_refine
+                    else None
+                ),
+                "refinement_vllm_max_model_len": script_args.refinement_vllm_max_model_len,
                 "distillation_temperature": script_args.distillation_temperature,
                 "top_k_loss": script_args.top_k_loss if script_args.top_k_loss > 0 else None,
                 "use_ema_teacher": script_args.use_ema_teacher,

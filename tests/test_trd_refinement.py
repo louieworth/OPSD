@@ -123,6 +123,35 @@ class RefinementPromptTests(unittest.TestCase):
         self.assertNotIn("I" * 500, rendered)
         self.assertNotIn("R" * 500, rendered)
 
+    def test_opsd_allows_exact_twenty_thousand_token_prompt_budget(self):
+        tokenizer = CharacterTokenizer()
+        empty_response_prompt = build_refinement_prompt(
+            tokenizer,
+            alg="opsd",
+            problem="p",
+            reference_solution="",
+            initial_response="",
+            max_model_len=21_024,
+            max_refinement_length=1_024,
+        )
+        exact_initial_response = "I" * (
+            20_000 - len(tokenizer.encode(empty_response_prompt))
+        )
+
+        rendered = build_refinement_prompt(
+            tokenizer,
+            alg="opsd",
+            problem="p",
+            reference_solution="",
+            initial_response=exact_initial_response,
+            max_model_len=21_024,
+            max_refinement_length=1_024,
+        )
+
+        self.assertEqual(len(tokenizer.encode(rendered)), 20_000)
+        self.assertIn(exact_initial_response, rendered)
+        self.assertNotIn("[... initial solution truncated ...]", rendered)
+
     def test_raises_instead_of_truncating_problem_or_instructions(self):
         with self.assertRaises(RefinementPromptError):
             build_refinement_prompt(

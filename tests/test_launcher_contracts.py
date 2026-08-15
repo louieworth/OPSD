@@ -103,11 +103,14 @@ class LauncherContractTests(unittest.TestCase):
             "DISTILL_POLICY_GRADIENT_UPDATES",
             "DISTILL_MAX_COMPLETION_LENGTH",
             "DISTILL_MAX_REFINEMENT_LENGTH",
+            "DISTILL_MAX_LENGTH",
             "DISTILL_SAVE_STEPS",
             "TRD_MAX_STEPS",
             "TRD_POLICY_GRADIENT_UPDATES",
             "TRD_MAX_COMPLETION_LENGTH",
             "TRD_MAX_REFINEMENT_LENGTH",
+            "TRD_MAX_LENGTH",
+            "TRD_REFINEMENT_MAX_MODEL_LEN",
             "TRD_SAVE_STEPS",
             "RUN_CONFIG",
             "RESULT_ROOT",
@@ -158,11 +161,14 @@ class LauncherContractTests(unittest.TestCase):
             "DISTILL_POLICY_GRADIENT_UPDATES",
             "DISTILL_MAX_COMPLETION_LENGTH",
             "DISTILL_MAX_REFINEMENT_LENGTH",
+            "DISTILL_MAX_LENGTH",
             "DISTILL_SAVE_STEPS",
             "TRD_MAX_STEPS",
             "TRD_POLICY_GRADIENT_UPDATES",
             "TRD_MAX_COMPLETION_LENGTH",
             "TRD_MAX_REFINEMENT_LENGTH",
+            "TRD_MAX_LENGTH",
+            "TRD_REFINEMENT_MAX_MODEL_LEN",
             "TRD_SAVE_STEPS",
             "RUN_CONFIG",
             "RESULT_ROOT",
@@ -382,6 +388,51 @@ class LauncherContractTests(unittest.TestCase):
         self.assertEqual("3", dry_run.value("--policy_gradient_updates"))
         self.assertEqual("256", dry_run.value("--max_completion_length"))
         self.assertEqual("128", dry_run.value("--max_refinement_length"))
+
+    def test_trd_default_token_budgets_for_every_model_scoped_launcher(self) -> None:
+        expected_by_source = {
+            "OPD": {
+                "max_length": 20_000,
+                "refinement_max_model_len": 20_000,
+                "refinement_prompt_budget": 18_976,
+            },
+            "OPSD": {
+                "max_length": 21_024,
+                "refinement_max_model_len": 21_024,
+                "refinement_prompt_budget": 20_000,
+            },
+        }
+
+        for source, scopes in MODEL_SCOPES.items():
+            expected = expected_by_source[source]
+            for model_scope in scopes:
+                with self.subTest(source=source, model_scope=model_scope):
+                    dry_run = DryRun(
+                        self.run_scoped_launcher(source, model_scope, "trd")
+                    )
+                    completion_length = int(
+                        dry_run.value("--max_completion_length")
+                    )
+                    refinement_length = int(
+                        dry_run.value("--max_refinement_length")
+                    )
+                    refinement_max_model_len = int(
+                        dry_run.value("--refinement_vllm_max_model_len")
+                    )
+
+                    self.assertEqual(1_024, completion_length, "y_o budget")
+                    self.assertEqual(1_024, refinement_length, "y_r budget")
+                    self.assertEqual(
+                        expected["max_length"], int(dry_run.value("--max_length"))
+                    )
+                    self.assertEqual(
+                        expected["refinement_max_model_len"],
+                        refinement_max_model_len,
+                    )
+                    self.assertEqual(
+                        expected["refinement_prompt_budget"],
+                        refinement_max_model_len - refinement_length,
+                    )
 
     def test_each_source_variant_and_model_has_unique_output_and_eval_namespace(self) -> None:
         training_namespaces: dict[Path, tuple[str, str, str]] = {}

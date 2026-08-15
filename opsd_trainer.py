@@ -175,7 +175,7 @@ class OPSDTrainer(SFTTrainer):
         refinement_vllm_server_port: int = 8002,
         refinement_vllm_connect_timeout: float = 10.0,
         refinement_vllm_request_timeout: float = 1800.0,
-        refinement_vllm_max_model_len: int = 20000,
+        refinement_vllm_max_model_len: int | None = None,
         alg: str = "opsd",
         teacher_model: PreTrainedModel | nn.Module | str | None = None,
     ):
@@ -196,7 +196,37 @@ class OPSDTrainer(SFTTrainer):
         self.teacher_refine = teacher_refine
         self.teacher_thinking = teacher_thinking
         self.max_refinement_length = max_refinement_length or args.max_completion_length
+        if refinement_vllm_max_model_len is None:
+            refinement_vllm_max_model_len = (
+                20_000 + self.max_refinement_length if alg == "opsd" else 20_000
+            )
         self.refinement_vllm_max_model_len = refinement_vllm_max_model_len
+        self.student_context_max_length = int(args.max_length)
+        student_response_reserve = max(
+            int(args.max_completion_length), int(self.max_refinement_length)
+        )
+        if self.teacher_refine:
+            if student_response_reserve >= self.student_context_max_length:
+                raise ValueError(
+                    "TRD requires --max_length to leave room for both y_o and y_r; "
+                    f"got max_length={self.student_context_max_length}, "
+                    f"max_completion_length={args.max_completion_length}, and "
+                    f"max_refinement_length={self.max_refinement_length}."
+                )
+            self.student_prompt_max_length = (
+                self.student_context_max_length - student_response_reserve
+            )
+        else:
+            self.student_prompt_max_length = self.student_context_max_length
+        if self.teacher_refine and self.max_refinement_length >= self.refinement_vllm_max_model_len:
+            raise ValueError(
+                "TRD requires refinement_vllm_max_model_len to leave room for y_r; "
+                f"got refinement_vllm_max_model_len={self.refinement_vllm_max_model_len} and "
+                f"max_refinement_length={self.max_refinement_length}."
+            )
+        self.refinement_prompt_max_length = (
+            self.refinement_vllm_max_model_len - self.max_refinement_length
+        )
         self.model_name_or_path = model if isinstance(model, str) else model.config._name_or_path
         self.model_revision = getattr(args, "student_model_revision", None)
         if isinstance(model, str) and self.model_revision is not None:
@@ -207,7 +237,9 @@ class OPSDTrainer(SFTTrainer):
         if data_collator is None:
             data_collator = SelfDistillationDataCollator(
                 tokenizer=processing_class,
-                max_length=args.max_length,
+                # TRD uses the same x prefix for y_o generation and student
+                # KL on y_r, so reserve the larger response budget up front.
+                max_length=self.student_prompt_max_length,
                 reason_first=reason_first,
                 student_thinking=student_thinking,
                 teacher_thinking=teacher_thinking,
@@ -567,8 +599,12 @@ class OPSDTrainer(SFTTrainer):
             "teacher_refine": self.teacher_refine,
             "model_name_or_path": str(self.model_name_or_path),
             "teacher_model_name_or_path": getattr(self.args, "teacher_model_name_or_path", None),
+            "max_length": self.student_context_max_length,
+            "student_prompt_max_length": self.student_prompt_max_length,
             "max_completion_length": self.args.max_completion_length,
             "max_refinement_length": self.max_refinement_length,
+            "refinement_prompt_max_length": self.refinement_prompt_max_length,
+            "refinement_vllm_max_model_len": self.refinement_vllm_max_model_len,
         }
 
     def _write_window_schedule(self, directory: str | os.PathLike[str]) -> None:
@@ -1267,9 +1303,16 @@ class OPSDTrainer(SFTTrainer):
         # Use prompts_text_for_vllm (without special tokens) for tokenization since vLLM expects clean text
         # Ensure add_special_tokens=False as vLLM typically handles prompts as raw text
         # Calculate max_length for prompts, ensuring it's positive
-        prompt_max_length = (
-            max(1, self.args.max_length - max_completion_length) if self.args.max_length else None
-        )
+        if self.teacher_refine:
+            # The same x prefix is later paired with y_r.  Respect the larger
+            # of the y_o/y_r reserves selected during trainer initialization.
+            prompt_max_length = self.student_prompt_max_length
+        else:
+            prompt_max_length = (
+                max(1, self.args.max_length - max_completion_length)
+                if self.args.max_length
+                else None
+            )
         prompt_tokenized = self.processing_class(
             prompts_text_for_vllm,
             return_tensors="pt",
@@ -1622,6 +1665,12 @@ class OPSDTrainer(SFTTrainer):
 
         generated_completion_ids = generated_ids[:, generated_prompt_width:]
         generated_completion_mask = generated_attention_mask[:, generated_prompt_width:]
+        if self.teacher_refine and generated_ids.shape[1] > self.student_context_max_length:
+            raise RuntimeError(
+                "TRD student rollout exceeded its configured context: "
+                f"sequence width {generated_ids.shape[1]} > "
+                f"max_length {self.student_context_max_length}."
+            )
         completion_ids = []
         clean_completion_texts = []
         for token_ids, token_mask in zip(generated_completion_ids, generated_completion_mask, strict=True):
@@ -1692,6 +1741,12 @@ class OPSDTrainer(SFTTrainer):
         student_prompt_width = student_prompts.shape[1]
         student_input_ids = torch.cat([student_prompts, target_tensor], dim=1)
         student_attention_mask = torch.cat([student_prompt_mask, target_mask], dim=1)
+        if student_input_ids.shape[1] > self.student_context_max_length:
+            raise RuntimeError(
+                "TRD student KL sequence exceeded its configured context: "
+                f"sequence width {student_input_ids.shape[1]} > "
+                f"max_length {self.student_context_max_length}."
+            )
 
         if teacher_prompt_ids is None:
             source_teacher_prompts = source["teacher_prompts"].cpu()
@@ -1712,6 +1767,12 @@ class OPSDTrainer(SFTTrainer):
         teacher_prompt_width = teacher_prompts.shape[1]
         teacher_input_ids = torch.cat([teacher_prompts, target_tensor], dim=1)
         teacher_attention_mask = torch.cat([teacher_prompt_mask, target_mask], dim=1)
+        if teacher_input_ids.shape[1] > self.refinement_vllm_max_model_len:
+            raise RuntimeError(
+                "TRD teacher KL sequence exceeded the refinement context: "
+                f"sequence width {teacher_input_ids.shape[1]} > "
+                f"refinement_vllm_max_model_len {self.refinement_vllm_max_model_len}."
+            )
 
         labels = torch.full_like(student_input_ids, -100)
         target_labels = target_tensor.clone()

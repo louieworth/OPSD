@@ -184,8 +184,11 @@ reuses the exact canonical refinement prefix followed by \(y_r\).
 
 TRD uses a fixed 4/4 topology on one **8×H100-80GB** node. Trainer ranks and
 their colocated student vLLM engines use GPUs 0–3; a tensor-parallel fixed
-teacher service uses GPUs 4–7. The 1,024-token budgets for both \(y_o\) and
-\(y_r\) are an H100-80GB assumption, not a supported capacity claim for 40GB
+teacher service uses GPUs 4–7. Both sources default \(y_o\) and \(y_r\) to 1,024
+tokens, but their context budgets are source-specific: OPSD allows 20,000-token
+student and refinement prompts and therefore uses 21,024-token student/refiner
+limits; OPD retains 18,976-token prompts and 20,000-token total limits. These
+budgets are an H100-80GB assumption, not a supported capacity claim for 40GB
 A100 GPUs. For OPD, each trainer rank also retains the frozen Qwen3-8B
 Transformers teacher needed for full-vocabulary KL; the TP=4 service supplies
 refinement generation only.
@@ -195,8 +198,13 @@ training, cleaned up on exit or signal, and stopped before optional all-eight-GP
 evaluation. Useful overrides include `TRD_REFINEMENT_HOST`,
 `TRD_REFINEMENT_PORT`, `TRD_REFINEMENT_MAX_MODEL_LEN`,
 `TRD_SERVER_STARTUP_TIMEOUT`, `TRD_REFINEMENT_REQUEST_TIMEOUT`, and
-`DISTILL_MAX_REFINEMENT_LENGTH`. This remains a fixed-step-0 TRD adaptation on
-the repository's current Qwen3 backbones and thinking-mode choices.
+`DISTILL_MAX_REFINEMENT_LENGTH`. Override the student total length with
+`TRD_MAX_LENGTH` and the refiner total length with
+`TRD_REFINEMENT_MAX_MODEL_LEN`; response budgets use
+`DISTILL_MAX_COMPLETION_LENGTH` and `DISTILL_MAX_REFINEMENT_LENGTH` (with their
+`TRD_MAX_COMPLETION_LENGTH` and `TRD_MAX_REFINEMENT_LENGTH` fallbacks). This
+remains a fixed-step-0 TRD adaptation on the repository's current Qwen3
+backbones and thinking-mode choices.
 
 After training exits successfully, each canonical launcher automatically starts
 its matching five-dataset thinking-mode evaluation. Set `AUTO_EVAL=0` to train
