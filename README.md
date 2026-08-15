@@ -99,8 +99,8 @@ name for the Qwen3-1.7B checkpoint:
 | `scripts/OPD/1B/` | Qwen3-1.7B | Fixed external Qwen3-8B, without privileged solution |
 | `scripts/OPD/4B/` | Qwen3-4B | Fixed external Qwen3-8B, without privileged solution |
 
-Every model directory exposes the same four algorithms and requires no model
-argument:
+Every OPD/OPSD model directory exposes the same four distillation algorithms
+and requires no model argument:
 
 | Launcher | Distillation support | Pointwise clip | Training trajectory |
 |---|---|---|---|
@@ -108,6 +108,10 @@ argument:
 | `top_k.sh` | Teacher top-16 | Off | Student rollout \(y_o\) |
 | `clip.sh` | Full vocabulary | 0.05 (OPSD 8B: 0.06) | Student rollout \(y_o\) |
 | `trd.sh` | Full vocabulary | Off | Teacher rewrite \(y_r\) |
+
+The three OPSD model directories additionally contain `sft.sh` and `grpo.sh`
+as paper-comparison baselines. Their location does not give either baseline an
+OPSD teacher; SFT uses reference trajectories and GRPO uses correctness reward.
 
 For example:
 
@@ -246,17 +250,15 @@ CUDA 12.8 as well; `setup_env.sh` prints a warning when it detects a mismatch.
 ├── scripts/
 │   ├── prepare_all.sh       # Pinned local data + HF model links
 │   ├── OPSD/               # Privileged same-base teacher source
-│   │   ├── 1B/             # Qwen3-1.7B student; vanilla/top_k/clip/trd
-│   │   ├── 4B/             # Qwen3-4B student; vanilla/top_k/clip/trd
-│   │   └── 8B/             # Qwen3-8B student; vanilla/top_k/clip/trd
+│   │   ├── 1B/             # Qwen3-1.7B; distillation + SFT/GRPO baselines
+│   │   ├── 4B/             # Qwen3-4B; distillation + SFT/GRPO baselines
+│   │   └── 8B/             # Qwen3-8B; distillation + SFT/GRPO baselines
 │   ├── OPD/                # Fixed stronger Qwen3-8B teacher source
 │   │   ├── 1B/             # Qwen3-1.7B student; vanilla/top_k/clip/trd
 │   │   └── 4B/             # Qwen3-4B student; vanilla/top_k/clip/trd
-│   ├── lib/                # Shared launcher and TRD service lifecycle helpers
+│   ├── lib/                # Shared distillation, baseline, and TRD helpers
 │   ├── prepare_models.sh    # Prepare all models or one selected model
-│   ├── run_eval.sh          # Model-parameterized formal evaluation
-│   ├── run_sft.sh           # SFT baseline launcher
-│   └── run_grpo.sh          # GRPO baseline launcher
+│   └── run_eval.sh          # Model-parameterized formal evaluation
 └── eval/
     ├── evaluate_math.py     # Evaluation script (vLLM)
     ├── run_model_eval.sh    # Model/checkpoint/dataset matrix runner
@@ -501,11 +503,28 @@ bash run_eval_nonthink.sh
 
 ### SFT Baseline
 
-See [`scripts/run_sft.sh`](scripts/run_sft.sh).
+The three model-scoped SFT launchers follow Table 7 of the paper: 100 optimizer
+steps, effective batch size 32 on eight ranks, learning rate `5e-6`, LoRA
+rank/alpha `64/128`, and a 16,000-token maximum sequence length.
+
+```bash
+bash scripts/OPSD/1B/sft.sh
+bash scripts/OPSD/4B/sft.sh
+bash scripts/OPSD/8B/sft.sh
+```
 
 ### GRPO Baseline
 
-See [`scripts/run_grpo.sh`](scripts/run_grpo.sh).
+The three model-scoped GRPO launchers follow Table 6 of the paper: 500 optimizer
+steps, effective batch size 32 on eight ranks, eight generations per prompt,
+learning rate `5e-6`, temperature `1.2`, zero reference-KL coefficient, LoRA
+rank/alpha `64/128`, and a 16,000-token maximum completion length.
+
+```bash
+bash scripts/OPSD/1B/grpo.sh
+bash scripts/OPSD/4B/grpo.sh
+bash scripts/OPSD/8B/grpo.sh
+```
 
 ### Acknowledgements
 Our implementation builds on [TRL GOLD Trainer](https://huggingface.co/docs/trl/gold_trainer). We sincerely thank [@simran135](https://github.com/simran135) and [@beanie00](https://github.com/beanie00) for identifying the prompt template bugs and the zero-2 issue, respectively!

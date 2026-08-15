@@ -203,6 +203,8 @@ if __name__ == "__main__":
                 "gradient_accumulation_steps": training_args.gradient_accumulation_steps,
                 "effective_batch_size": effective_batch_size,
                 "num_train_epochs": training_args.num_train_epochs,
+                "max_steps": training_args.max_steps,
+                "num_iterations": training_args.num_iterations,
                 "num_generations": training_args.num_generations,
                 "max_prompt_length": training_args.max_prompt_length,
                 "max_completion_length": training_args.max_completion_length,

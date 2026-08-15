@@ -73,9 +73,15 @@ if __name__ == "__main__":
         training_args.per_device_train_batch_size * training_args.gradient_accumulation_steps * num_processes
     )
 
-    # Create concise run name
+    # Create concise run name. Paper baselines are step-budgeted; avoid
+    # logging the ignored/default epoch count when max_steps is active.
+    duration_label = (
+        f"steps{training_args.max_steps}"
+        if training_args.max_steps > 0
+        else f"ep{training_args.num_train_epochs}"
+    )
     full_wandb_run_name = (
-        f"SFT_{model_name}_" f"lr{lr_str}_" f"bs{effective_batch_size}_" f"ep{training_args.num_train_epochs}"
+        f"SFT_{model_name}_" f"lr{lr_str}_" f"bs{effective_batch_size}_" f"{duration_label}"
     )
 
     ################
@@ -94,6 +100,7 @@ if __name__ == "__main__":
                 "gradient_accumulation_steps": training_args.gradient_accumulation_steps,
                 "effective_batch_size": effective_batch_size,
                 "num_train_epochs": training_args.num_train_epochs,
+                "max_steps": training_args.max_steps,
                 "max_seq_length": training_args.max_length,
                 "use_peft": model_args.use_peft,
                 "lora_r": model_args.lora_r if model_args.use_peft else None,
