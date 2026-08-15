@@ -19,6 +19,8 @@ import warnings
 from collections import defaultdict, deque
 from collections.abc import Callable
 from contextlib import contextmanager, nullcontext
+from functools import partial
+from pathlib import Path
 from typing import Any, Optional
 
 import torch
@@ -28,6 +30,7 @@ import torch.nn.functional as F
 from accelerate import PartialState
 from accelerate.utils import DistributedType, broadcast_object_list, gather_object, is_peft_model
 from datasets import Dataset, IterableDataset
+from torch.utils.data import DataLoader
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from transformers import AutoModelForCausalLM
 from transformers.data.data_collator import DataCollator
@@ -39,7 +42,7 @@ from transformers.modeling_utils import PreTrainedModel
 from transformers.processing_utils import ProcessorMixin
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 from transformers.trainer_callback import TrainerCallback, TrainerControl, TrainerState
-from transformers.trainer_utils import EvalPrediction
+from transformers.trainer_utils import EvalPrediction, seed_worker
 from transformers.utils import (
     is_flash_attn_2_available,
     is_liger_kernel_available,
@@ -62,7 +65,8 @@ from trl.trainer.utils import (
     pad,
 )
 from trl.experimental.gold.gold_config import GOLDConfig
-from data_collator import SelfDistillationDataCollator
+from data_collator import SelfDistillationDataCollator, WindowDataCollator
+from trd_refinement import TeacherVLLMClient, build_refinement_prompt
 
 
 if is_peft_available():
@@ -117,6 +121,25 @@ class GOLDVLLMSyncCallback(TrainerCallback):
                 self.trainer._last_vllm_sync_step = state.global_step
 
 
+class GenerationOutputCallback(TrainerCallback):
+    """Persist generation records at completed update boundaries and at train end."""
+
+    def __init__(self, trainer):
+        self.trainer = trainer
+
+    def on_step_end(self, args, state: TrainerState, control: TrainerControl, **kwargs):
+        if state.global_step > 0 and state.global_step % self.trainer._generation_save_frequency == 0:
+            self.trainer._save_generation_outputs(state.global_step)
+
+    def on_train_end(self, args, state: TrainerState, control: TrainerControl, **kwargs):
+        try:
+            self.trainer._save_generation_outputs(state.global_step)
+        finally:
+            client = self.trainer.refinement_vllm_client
+            if client is not None:
+                client.close()
+
+
 class OPSDTrainer(SFTTrainer):
     _tag_names = ["trl", "opsd"]
     _name = "OPSD"
@@ -145,6 +168,14 @@ class OPSDTrainer(SFTTrainer):
         ema_decay: float = 0.999,
         student_thinking: bool = False,
         teacher_thinking: bool = True,
+        teacher_refine: bool = False,
+        max_refinement_length: int | None = None,
+        distillation_temperature: float | None = None,
+        refinement_vllm_server_host: str = "127.0.0.1",
+        refinement_vllm_server_port: int = 8002,
+        refinement_vllm_connect_timeout: float = 10.0,
+        refinement_vllm_request_timeout: float = 1800.0,
+        refinement_vllm_max_model_len: int = 20000,
         alg: str = "opsd",
         teacher_model: PreTrainedModel | nn.Module | str | None = None,
     ):
@@ -162,6 +193,10 @@ class OPSDTrainer(SFTTrainer):
             raise ValueError("fixed_teacher is an OPSD option; the external OPD teacher is always fixed.")
 
         self.alg = alg
+        self.teacher_refine = teacher_refine
+        self.teacher_thinking = teacher_thinking
+        self.max_refinement_length = max_refinement_length or args.max_completion_length
+        self.refinement_vllm_max_model_len = refinement_vllm_max_model_len
         self.model_name_or_path = model if isinstance(model, str) else model.config._name_or_path
         self.model_revision = getattr(args, "student_model_revision", None)
         if isinstance(model, str) and self.model_revision is not None:
@@ -206,6 +241,9 @@ class OPSDTrainer(SFTTrainer):
         self.lmbda = args.lmbda
         self.beta = args.beta
         self.temperature = args.temperature
+        self.distillation_temperature = (
+            args.temperature if distillation_temperature is None else distillation_temperature
+        )
         self.top_p = args.top_p
         self.seq_kd = args.seq_kd
         self.use_thinking_machines_loss = use_thinking_machines_loss
@@ -216,6 +254,12 @@ class OPSDTrainer(SFTTrainer):
         self.use_ema_teacher = use_ema_teacher
         self.ema_decay = ema_decay
         self._ema_params = None  # lazily initialized on first optimizer step
+        self.windowed_policy_updates = bool(getattr(args, "windowed_policy_updates", False))
+        self.total_rollout_steps = getattr(args, "total_rollout_steps", None)
+        self.policy_gradient_updates = getattr(args, "policy_gradient_updates", None)
+        self.rollouts_per_update = int(getattr(args, "rollouts_per_update", 1))
+        self.rollout_micro_batch_size = int(args.per_device_train_batch_size)
+        self._schedule_metadata_written = False
 
         # Validate fixed_teacher option
         if self.alg == "opsd" and self.fixed_teacher and peft_config is None:
@@ -251,6 +295,17 @@ class OPSDTrainer(SFTTrainer):
             print("Teacher will first reason about the privileged solution, then evaluate student's response")
             print(f"{'='*80}\n")
 
+        self.refinement_vllm_client = None
+        if self.teacher_refine and self.accelerator.is_main_process:
+            self.refinement_vllm_client = TeacherVLLMClient(
+                host=refinement_vllm_server_host,
+                port=refinement_vllm_server_port,
+                connect_timeout=refinement_vllm_connect_timeout,
+                read_timeout=refinement_vllm_request_timeout,
+                expected_world_size=4,
+                max_model_len=refinement_vllm_max_model_len,
+            )
+
         # Track per-step loss statistics for on/off-policy batches (used in logging)
         self._on_policy_loss_total = 0.0
         self._off_policy_loss_total = 0.0
@@ -262,6 +317,7 @@ class OPSDTrainer(SFTTrainer):
         # Track generation outputs for saving
         self._generation_outputs_buffer = []
         self._generation_save_frequency = 5  # Save every 5 steps
+        self.add_callback(GenerationOutputCallback(self))
 
         self.generation_config = GenerationConfig(
             max_new_tokens=args.max_completion_length,
@@ -433,6 +489,131 @@ class OPSDTrainer(SFTTrainer):
                 if column not in self._signature_columns:
                     self._signature_columns.append(column)
 
+    def get_train_dataloader(self):
+        """Return ordinary batches in legacy mode and whole update windows otherwise."""
+        if not self.windowed_policy_updates:
+            return super().get_train_dataloader()
+        if self.train_dataset is None:
+            raise ValueError("Trainer requires a train dataset.")
+        if isinstance(self.train_dataset, IterableDataset):
+            raise ValueError("Windowed policy updates do not support IterableDataset.")
+        if self.accelerator.split_batches:
+            raise ValueError("Windowed policy updates require Accelerate split_batches=False.")
+        if self.accelerator.dispatch_batches is True:
+            raise ValueError("Windowed policy updates require Accelerate dispatch_batches=False.")
+        if int(self.accelerator.gradient_accumulation_steps) != 1:
+            raise ValueError(
+                "Windowed policy updates require launch-level gradient accumulation 1; "
+                f"Accelerate is configured with {self.accelerator.gradient_accumulation_steps}."
+            )
+
+        micro_batch_size = self.rollout_micro_batch_size
+        window_size = self.rollouts_per_update
+        loader_batch_size = micro_batch_size * window_size
+        minimum_examples = loader_batch_size * self.accelerator.num_processes
+        if len(self.train_dataset) < minimum_examples:
+            raise ValueError(
+                "The dataset is too small for one complete distributed policy-update window: "
+                f"need at least {minimum_examples} examples, found {len(self.train_dataset)}."
+            )
+
+        # The DataLoader carries B*R CPU examples, but DeepSpeed still executes
+        # one B-sized model microbatch at a time inside training_step.
+        deepspeed_plugin = self.accelerator.state.deepspeed_plugin
+        if deepspeed_plugin is not None:
+            ds_config = deepspeed_plugin.deepspeed_config
+            ds_config["train_micro_batch_size_per_gpu"] = micro_batch_size
+            ds_config["gradient_accumulation_steps"] = 1
+            ds_config["train_batch_size"] = micro_batch_size * self.accelerator.num_processes
+
+        dataloader_params = {
+            "batch_size": loader_batch_size,
+            "collate_fn": WindowDataCollator(
+                self.data_collator,
+                micro_batch_size=micro_batch_size,
+                window_size=window_size,
+            ),
+            "num_workers": self.args.dataloader_num_workers,
+            "pin_memory": self.args.dataloader_pin_memory,
+            "persistent_workers": self.args.dataloader_persistent_workers,
+            "sampler": self._get_train_sampler(self.train_dataset),
+            "drop_last": True,
+            "worker_init_fn": partial(
+                seed_worker,
+                num_workers=self.args.dataloader_num_workers,
+                rank=self.args.process_index,
+            ),
+        }
+        if self.args.dataloader_num_workers > 0:
+            dataloader_params["prefetch_factor"] = self.args.dataloader_prefetch_factor
+
+        dataloader = DataLoader(self.train_dataset, **dataloader_params)
+        return self.accelerator.prepare_data_loader(dataloader, device_placement=False)
+
+    def get_total_train_batch_size(self, args) -> int:
+        batch_size = super().get_total_train_batch_size(args)
+        return batch_size * self.rollouts_per_update if self.windowed_policy_updates else batch_size
+
+    def _window_schedule_metadata(self) -> dict[str, Any]:
+        return {
+            "total_rollout_steps": self.total_rollout_steps,
+            "policy_gradient_updates": self.policy_gradient_updates,
+            "rollouts_per_update": self.rollouts_per_update,
+            "per_device_train_batch_size": self.rollout_micro_batch_size,
+            "world_size": self.accelerator.num_processes,
+            "dataset_length": len(self.train_dataset) if self.train_dataset is not None else None,
+            "dataset_fingerprint": getattr(self.train_dataset, "_fingerprint", None),
+            "alg": self.alg,
+            "teacher_refine": self.teacher_refine,
+            "model_name_or_path": str(self.model_name_or_path),
+            "teacher_model_name_or_path": getattr(self.args, "teacher_model_name_or_path", None),
+            "max_completion_length": self.args.max_completion_length,
+            "max_refinement_length": self.max_refinement_length,
+        }
+
+    def _write_window_schedule(self, directory: str | os.PathLike[str]) -> None:
+        if not self.windowed_policy_updates or not self.args.should_save:
+            return
+        import json
+
+        directory = Path(directory)
+        directory.mkdir(parents=True, exist_ok=True)
+        path = directory / "window_schedule.json"
+        with path.open("w", encoding="utf-8") as handle:
+            json.dump(self._window_schedule_metadata(), handle, indent=2, sort_keys=True)
+
+    def prepare_window_schedule(self, resume_from_checkpoint: str | None = None) -> None:
+        """Persist schedule metadata and reject incompatible resume settings."""
+        if not self.windowed_policy_updates:
+            return
+        import json
+
+        expected = self._window_schedule_metadata()
+        if resume_from_checkpoint is not None:
+            schedule_path = Path(resume_from_checkpoint) / "window_schedule.json"
+            if not schedule_path.is_file():
+                raise ValueError(
+                    f"Cannot exactly resume a windowed run: missing {schedule_path}."
+                )
+            with schedule_path.open("r", encoding="utf-8") as handle:
+                saved = json.load(handle)
+            if saved != expected:
+                differing = {
+                    key: {"checkpoint": saved.get(key), "current": expected.get(key)}
+                    for key in sorted(set(saved) | set(expected))
+                    if saved.get(key) != expected.get(key)
+                }
+                raise ValueError(f"Window schedule differs from checkpoint: {differing}")
+        self._write_window_schedule(self.args.output_dir)
+        self.accelerator.wait_for_everyone()
+
+    def _save_checkpoint(self, model, trial):
+        super()._save_checkpoint(model, trial)
+        if self.windowed_policy_updates:
+            run_dir = self._get_output_dir(trial=trial)
+            checkpoint_dir = Path(run_dir) / f"checkpoint-{self.state.global_step}"
+            self._write_window_schedule(checkpoint_dir)
+
     @staticmethod
     def generalized_jsd_loss(
         student_logits,
@@ -464,9 +645,9 @@ class OPSDTrainer(SFTTrainer):
             reduction:
                 Specifies the reduction to apply to the output (default: 'batchmean')
             top_k:
-                If set, restricts the loss to only the top-k tokens of the teacher distribution. Both student and
-                teacher distributions are renormalized over these k tokens before computing JSD. This reduces memory
-                and focuses distillation on the teacher's most probable tokens. (default: None = full vocabulary)
+                If set, approximate forward KL over the teacher's top-k tokens. The teacher distribution is
+                renormalized over those tokens, while the student probabilities retain their full-vocabulary
+                denominator, as in Eq. (10) of arXiv:2603.07079. This mode requires beta=0.
             token_clip:
                 if set, clips per-token divergence values to this maximum before reduction. Prevents style tokens from dominating the gradient signal over math tokens.
 
@@ -474,20 +655,43 @@ class OPSDTrainer(SFTTrainer):
             loss: Scalar tensor with the generalized JSD loss
         """
 
-        if logits_are_probs:
+        if top_k is not None and top_k > 0:
+            if beta != 0:
+                raise ValueError("top-k distillation is defined only for forward KL (beta=0).")
+            if top_k > teacher_logits.size(-1):
+                raise ValueError(
+                    f"top_k={top_k} exceeds the teacher vocabulary size {teacher_logits.size(-1)}."
+                )
+
+            if logits_are_probs:
+                student_log_probs_full = torch.log(student_logits.clamp_min(1e-8))
+                teacher_top_k_probs, top_k_indices = torch.topk(teacher_logits, k=top_k, dim=-1)
+                teacher_top_k_probs = teacher_top_k_probs / teacher_top_k_probs.sum(
+                    dim=-1, keepdim=True
+                ).clamp_min(1e-8)
+                teacher_log_probs = torch.log(teacher_top_k_probs.clamp_min(1e-8))
+            else:
+                student_scaled_logits = student_logits / temperature
+                teacher_scaled_logits = teacher_logits / temperature
+                _, top_k_indices = torch.topk(teacher_scaled_logits, k=top_k, dim=-1)
+                teacher_top_k_logits = torch.gather(
+                    teacher_scaled_logits, dim=-1, index=top_k_indices
+                )
+                teacher_log_probs = F.log_softmax(teacher_top_k_logits, dim=-1)
+                student_log_probs_full = F.log_softmax(student_scaled_logits, dim=-1)
+
+            # Eq. (10): only the teacher is renormalized on S_k. The student
+            # probability keeps the full-vocabulary partition function.
+            student_log_probs = torch.gather(
+                student_log_probs_full, dim=-1, index=top_k_indices
+            )
+        elif logits_are_probs:
             student_log_probs = torch.log(student_logits.clamp_min(1e-8))
             teacher_log_probs = torch.log(teacher_logits.clamp_min(1e-8))
         else:
             # Apply temperature scaling to logits before computing probabilities
             student_logits = student_logits / temperature
             teacher_logits = teacher_logits / temperature
-
-            if top_k is not None and top_k > 0:
-                # Restrict to top-k tokens of the teacher distribution and renormalize.
-                # Shape: [batch, seq_len, top_k]
-                _, top_k_indices = torch.topk(teacher_logits, k=top_k, dim=-1)
-                student_logits = torch.gather(student_logits, dim=-1, index=top_k_indices)
-                teacher_logits = torch.gather(teacher_logits, dim=-1, index=top_k_indices)
 
             # Compute log probabilities for student and probabilities for teacher
             student_log_probs = F.log_softmax(student_logits, dim=-1)
@@ -532,6 +736,20 @@ class OPSDTrainer(SFTTrainer):
             return jsd.mean()
         else:
             return jsd
+
+    def _trd_global_token_mean(
+        self, local_loss_sum: torch.Tensor, labels: torch.Tensor
+    ) -> torch.Tensor:
+        """Scale a local TRD token sum so DP gradient averaging yields a global token mean."""
+        local_token_count = (labels != -100).sum().to(device=local_loss_sum.device)
+        global_token_count = self.accelerator.reduce(local_token_count, reduction="sum")
+        if int(global_token_count.item()) <= 0:
+            raise RuntimeError("TRD requires at least one unmasked target token globally.")
+        return (
+            local_loss_sum
+            * self.accelerator.num_processes
+            / global_token_count.to(dtype=local_loss_sum.dtype)
+        )
 
     def _update_ema(self):
         """Update EMA parameters after an optimizer step.
@@ -701,7 +919,7 @@ class OPSDTrainer(SFTTrainer):
 
         if self.use_thinking_machines_loss:
             # For reverse KL, we only need log-probs of sampled tokens
-            student_log_probs = F.log_softmax(student_logits / self.temperature, dim=-1)
+            student_log_probs = F.log_softmax(student_logits / self.distillation_temperature, dim=-1)
             student_log_probs_sampled = torch.gather(
                 student_log_probs, dim=-1, index=sampled_token_ids.unsqueeze(-1)
             ).squeeze(-1)
@@ -754,7 +972,7 @@ class OPSDTrainer(SFTTrainer):
             teacher_logits = outputs_teacher.logits[:, teacher_prompt_len - 1 : -1, :]
 
             if self.use_thinking_machines_loss:
-                teacher_log_probs = F.log_softmax(teacher_logits / self.temperature, dim=-1)
+                teacher_log_probs = F.log_softmax(teacher_logits / self.distillation_temperature, dim=-1)
                 teacher_log_probs_sampled = torch.gather(
                     teacher_log_probs, dim=-1, index=sampled_token_ids.unsqueeze(-1)
                 ).squeeze(-1)
@@ -803,10 +1021,13 @@ class OPSDTrainer(SFTTrainer):
                 teacher_logits=teacher_logits_for_loss,
                 labels=shifted_labels,
                 beta=self.beta,
-                temperature=self.temperature,  # Let the function handle temperature
+                temperature=self.distillation_temperature,
                 top_k=self.top_k_loss,
                 token_clip=self.jsd_token_clip,
+                reduction="sum" if self.teacher_refine else "batchmean",
             )
+            if self.teacher_refine:
+                loss = self._trd_global_token_mean(loss, shifted_labels)
             del student_logits_for_loss, teacher_logits_for_loss
 
         empty_cache()
@@ -960,7 +1181,7 @@ class OPSDTrainer(SFTTrainer):
         if self.vllm_mode == "server":
             all_prompts_text = gather_object(prompts_text_for_vllm)
             if self.accelerator.is_main_process:
-                completion_ids = self.vllm_client.generate(
+                server_result = self.vllm_client.generate(
                     prompts=all_prompts_text,
                     n=1,  # In GKD, we generate 1 completion per prompt from student
                     repetition_penalty=repetition_penalty,
@@ -969,12 +1190,15 @@ class OPSDTrainer(SFTTrainer):
                     top_k=top_k,
                     min_p=min_p,
                     max_tokens=max_completion_length,
-                    presence_penalty=presence_penalty,
                     guided_decoding_regex=self.vllm_guided_decoding_regex,
+                    generation_kwargs={"presence_penalty": presence_penalty},
                 )
+                completion_ids = server_result["completion_ids"]
             else:
                 completion_ids = [None] * len(all_prompts_text)
-            completion_ids = broadcast_object_list(completion_ids, from_process=0)
+            completion_holder = [completion_ids]
+            broadcast_object_list(completion_holder, from_process=0)
+            completion_ids = completion_holder[0]
             process_slice = slice(
                 self.accelerator.process_index * len(prompts_text_for_vllm),
                 (self.accelerator.process_index + 1) * len(prompts_text_for_vllm),
@@ -1135,7 +1359,7 @@ class OPSDTrainer(SFTTrainer):
         if self.vllm_mode == "server":
             all_prompts_text = gather_object(prompts_text)
             if self.accelerator.is_main_process:
-                completion_ids = self.vllm_client.generate(
+                server_result = self.vllm_client.generate(
                     prompts=all_prompts_text,
                     n=1,
                     temperature=temperature,
@@ -1143,9 +1367,12 @@ class OPSDTrainer(SFTTrainer):
                     top_k=top_k,
                     max_tokens=max_reasoning_length,
                 )
+                completion_ids = server_result["completion_ids"]
             else:
                 completion_ids = [None] * len(all_prompts_text)
-            completion_ids = broadcast_object_list(completion_ids, from_process=0)
+            completion_holder = [completion_ids]
+            broadcast_object_list(completion_holder, from_process=0)
+            completion_ids = completion_holder[0]
             process_slice = slice(
                 self.accelerator.process_index * len(prompts_text),
                 (self.accelerator.process_index + 1) * len(prompts_text),
@@ -1314,6 +1541,521 @@ class OPSDTrainer(SFTTrainer):
             empty_cache()
             self.vllm_engine.wake_up(tags=["kv_cache"])
 
+    @staticmethod
+    def _detach_to_cpu(value):
+        if torch.is_tensor(value):
+            return value.detach().cpu()
+        if isinstance(value, dict):
+            return {key: OPSDTrainer._detach_to_cpu(item) for key, item in value.items()}
+        if isinstance(value, list):
+            return [OPSDTrainer._detach_to_cpu(item) for item in value]
+        if isinstance(value, tuple):
+            return tuple(OPSDTrainer._detach_to_cpu(item) for item in value)
+        return value
+
+    def _ensure_student_vllm_current(self):
+        """Synchronize before a window, including the first window after resume."""
+        if self.use_vllm and self._last_vllm_sync_step != self.state.global_step:
+            self._move_model_to_vllm()
+            self._last_vllm_sync_step = self.state.global_step
+
+    def _apply_reason_first(self, model, inputs):
+        """Build the legacy reason-first teacher prompt without performing backward."""
+        if not self.reason_first:
+            return inputs
+        with unwrap_model_for_generation(model, self.accelerator) as unwrapped_model:
+            teacher_reasoning_ids = self.generate_teacher_reasoning(
+                unwrapped_model,
+                inputs["teacher_reasoning_prompts"],
+                inputs.get("teacher_reasoning_attention_mask"),
+            )
+        reasoning_prompt_len = inputs["teacher_reasoning_prompt_length"]
+        reasoning_completions = teacher_reasoning_ids[:, reasoning_prompt_len:]
+        teacher_prompts = torch.cat(
+            [
+                inputs["teacher_reasoning_prompts"],
+                reasoning_completions,
+                inputs["teacher_transition_tokens"],
+            ],
+            dim=1,
+        )
+        inputs["teacher_prompts"] = teacher_prompts
+        teacher_attention_mask = torch.ones_like(teacher_prompts)
+        if self.processing_class.pad_token_id is not None:
+            teacher_attention_mask[teacher_prompts == self.processing_class.pad_token_id] = 0
+        inputs["teacher_prompt_attention_mask"] = teacher_attention_mask
+        inputs["teacher_prompt_length"] = teacher_prompts.shape[1]
+        inputs["teacher_prompt_lengths_per_example"] = torch.full(
+            (teacher_prompts.shape[0],),
+            teacher_prompts.shape[1],
+            dtype=torch.long,
+            device=teacher_prompts.device,
+        )
+        return inputs
+
+    def _collect_original_rollout(self, model, inputs, rollout_step: int) -> dict[str, Any]:
+        """Generate y_o and return a graph-free CPU record."""
+        inputs = self._apply_reason_first(model, dict(inputs))
+        if self.use_vllm:
+            self._wake_vllm_if_needed()
+            result = self._generate_on_policy_outputs_vllm(
+                inputs, self.generation_config, self.processing_class.pad_token_id
+            )
+            generated_ids, generated_attention_mask, _, prompt_texts, completion_texts = result
+            generated_prompt_width = generated_ids.shape[1] - self.generation_config.max_new_tokens
+        else:
+            with unwrap_model_for_generation(model, self.accelerator) as unwrapped_model:
+                result = self.generate_on_policy_outputs(
+                    unwrapped_model,
+                    inputs,
+                    self.generation_config,
+                    self.processing_class.pad_token_id,
+                )
+            generated_ids, generated_attention_mask, _ = result
+            prompt_texts = self.processing_class.batch_decode(
+                inputs["student_prompts"], skip_special_tokens=False
+            )
+            generated_prompt_width = int(inputs["student_prompt_length"])
+            completion_texts = self.processing_class.batch_decode(
+                generated_ids[:, generated_prompt_width:], skip_special_tokens=True
+            )
+
+        generated_completion_ids = generated_ids[:, generated_prompt_width:]
+        generated_completion_mask = generated_attention_mask[:, generated_prompt_width:]
+        completion_ids = []
+        clean_completion_texts = []
+        for token_ids, token_mask in zip(generated_completion_ids, generated_completion_mask, strict=True):
+            ids = token_ids[token_mask.bool()].detach().cpu().tolist()
+            if not ids:
+                raise RuntimeError(f"Student generated an empty y_o at rollout step {rollout_step}.")
+            completion_ids.append(ids)
+            clean_completion_texts.append(
+                self.processing_class.decode(ids, skip_special_tokens=True)
+            )
+
+        return {
+            "inputs": self._detach_to_cpu(inputs),
+            # Preserve the exact legacy student sequence for vanilla windowed
+            # updates.  Re-tokenizing or re-padding it would make U=N differ
+            # from the historical one-rollout-per-update path.
+            "generated_ids": generated_ids.detach().cpu(),
+            "generated_attention_mask": generated_attention_mask.detach().cpu(),
+            "generated_prompt_width": generated_prompt_width,
+            "prompt_texts": list(prompt_texts),
+            "original_completion_ids": completion_ids,
+            "original_completion_texts": clean_completion_texts,
+            "raw_completion_texts": list(completion_texts),
+            "rollout_step": rollout_step,
+        }
+
+    def _pad_token_lists(
+        self, sequences: list[list[int]], *, padding_side: str = "right"
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if not sequences or any(len(sequence) == 0 for sequence in sequences):
+            raise RuntimeError("Every distillation target must contain at least one token.")
+        if padding_side not in {"left", "right"}:
+            raise ValueError(f"Unsupported padding side: {padding_side}.")
+        width = max(len(sequence) for sequence in sequences)
+        pad_token_id = self.processing_class.pad_token_id
+        if pad_token_id is None:
+            raise ValueError("A pad token is required for variable-length distillation batches.")
+        input_ids = torch.full((len(sequences), width), pad_token_id, dtype=torch.long)
+        attention_mask = torch.zeros((len(sequences), width), dtype=torch.long)
+        for row, sequence in enumerate(sequences):
+            sequence_tensor = torch.tensor(sequence, dtype=torch.long)
+            target_slice = slice(0, len(sequence)) if padding_side == "right" else slice(width - len(sequence), width)
+            input_ids[row, target_slice] = sequence_tensor
+            attention_mask[row, target_slice] = 1
+        return input_ids, attention_mask
+
+    def _build_distillation_batch(
+        self,
+        rollout: dict[str, Any],
+        target_ids: list[list[int]],
+        teacher_prompt_ids: list[list[int]] | None = None,
+    ) -> dict[str, torch.Tensor]:
+        """Build aligned student/teacher inputs that train only on target_ids."""
+        source = rollout["inputs"]
+        target_tensor, target_mask = self._pad_token_lists(target_ids)
+
+        source_student_prompts = source["student_prompts"].cpu()
+        source_student_mask = source["student_prompt_attention_mask"].cpu()
+        student_prompt_sequences = [
+            token_ids[token_mask.bool()].tolist()
+            for token_ids, token_mask in zip(
+                source_student_prompts, source_student_mask, strict=True
+            )
+        ]
+        student_prompts, student_prompt_mask = self._pad_token_lists(
+            student_prompt_sequences, padding_side="left"
+        )
+        student_prompt_width = student_prompts.shape[1]
+        student_input_ids = torch.cat([student_prompts, target_tensor], dim=1)
+        student_attention_mask = torch.cat([student_prompt_mask, target_mask], dim=1)
+
+        if teacher_prompt_ids is None:
+            source_teacher_prompts = source["teacher_prompts"].cpu()
+            source_teacher_mask = source["teacher_prompt_attention_mask"].cpu()
+            teacher_prompt_sequences = [
+                token_ids[token_mask.bool()].tolist()
+                for token_ids, token_mask in zip(
+                    source_teacher_prompts, source_teacher_mask, strict=True
+                )
+            ]
+            teacher_prompts, teacher_prompt_mask = self._pad_token_lists(
+                teacher_prompt_sequences, padding_side="left"
+            )
+        else:
+            teacher_prompts, teacher_prompt_mask = self._pad_token_lists(
+                teacher_prompt_ids, padding_side="left"
+            )
+        teacher_prompt_width = teacher_prompts.shape[1]
+        teacher_input_ids = torch.cat([teacher_prompts, target_tensor], dim=1)
+        teacher_attention_mask = torch.cat([teacher_prompt_mask, target_mask], dim=1)
+
+        labels = torch.full_like(student_input_ids, -100)
+        target_labels = target_tensor.clone()
+        target_labels[target_mask == 0] = -100
+        labels[:, student_prompt_width:] = target_labels
+
+        return {
+            "student_input_ids": student_input_ids,
+            "student_attention_mask": student_attention_mask,
+            "student_prompt_length": student_prompt_width,
+            "teacher_input_ids": teacher_input_ids,
+            "teacher_attention_mask": teacher_attention_mask,
+            "teacher_prompt_length": teacher_prompt_width,
+            "labels": labels,
+        }
+
+    def _build_vanilla_distillation_batch(
+        self, rollout: dict[str, Any]
+    ) -> dict[str, torch.Tensor]:
+        """Rebuild the legacy y_o batch without changing its token layout."""
+        source = rollout["inputs"]
+        generated_ids = rollout["generated_ids"].cpu()
+        generated_attention_mask = rollout["generated_attention_mask"].cpu()
+        student_prompt_width = int(rollout["generated_prompt_width"])
+        generation_ids = generated_ids[:, student_prompt_width:]
+
+        teacher_prompts = source["teacher_prompts"].cpu()
+        teacher_prompt_width = teacher_prompts.shape[1]
+        teacher_input_ids = torch.cat([teacher_prompts, generation_ids], dim=1)
+        teacher_attention_mask = torch.ones_like(teacher_input_ids)
+        pad_token_id = self.processing_class.pad_token_id
+        if pad_token_id is not None:
+            teacher_attention_mask[teacher_input_ids == pad_token_id] = 0
+
+        labels = generated_ids.clone()
+        prompt_lengths = source["student_prompt_lengths_per_example"]
+        for row in range(labels.shape[0]):
+            labels[row, : int(prompt_lengths[row].item())] = -100
+        if pad_token_id is not None:
+            labels[labels == pad_token_id] = -100
+
+        return {
+            "student_input_ids": generated_ids,
+            "student_attention_mask": generated_attention_mask,
+            "student_prompt_length": student_prompt_width,
+            "teacher_input_ids": teacher_input_ids,
+            "teacher_attention_mask": teacher_attention_mask,
+            "teacher_prompt_length": teacher_prompt_width,
+            "labels": labels,
+        }
+
+    def _generate_refined_completions(
+        self,
+        rollout: dict[str, Any],
+        rollout_offset: int,
+    ) -> tuple[list[list[int]], list[list[int]], list[str]]:
+        """Generate y_r on rank 0 and scatter results by stable request ID."""
+        rank = self.accelerator.process_index
+        inputs = rollout["inputs"]
+        try:
+            prompts = [
+                build_refinement_prompt(
+                    tokenizer=self.processing_class,
+                    alg=self.alg,
+                    problem=problem,
+                    initial_response=initial_response,
+                    reference_solution=reference_solution,
+                    teacher_thinking=self.teacher_thinking,
+                    max_model_len=self.refinement_vllm_max_model_len,
+                    max_refinement_length=self.max_refinement_length,
+                )
+                for problem, initial_response, reference_solution in zip(
+                    inputs["problems"],
+                    rollout["original_completion_texts"],
+                    inputs["reference_solutions"],
+                    strict=True,
+                )
+            ]
+            local_records = [
+                {
+                    "request_id": (
+                        self.state.global_step,
+                        rollout_offset,
+                        rank,
+                        local_index,
+                    ),
+                    "prompt": prompt,
+                }
+                for local_index, prompt in enumerate(prompts)
+            ]
+            local_status = {"ok": True, "rank": rank, "records": local_records}
+        except Exception as exc:
+            prompts = []
+            local_records = []
+            local_status = {"ok": False, "rank": rank, "error": repr(exc), "records": []}
+
+        statuses = gather_object([local_status])
+        response_payload = None
+        if self.accelerator.is_main_process:
+            try:
+                failures = [status for status in statuses if not status["ok"]]
+                if failures:
+                    raise RuntimeError(f"Failed to build refinement prompts: {failures}")
+                all_records = sorted(
+                    [record for status in statuses for record in status["records"]],
+                    key=lambda record: record["request_id"],
+                )
+                generation = self.refinement_vllm_client.generate(
+                    prompts=[record["prompt"] for record in all_records],
+                    n=1,
+                    repetition_penalty=getattr(self.args, "repetition_penalty", 1.0),
+                    temperature=self.temperature,
+                    top_p=self.top_p,
+                    top_k=self.args.top_k if self.args.top_k > 0 else -1,
+                    min_p=getattr(self.args, "min_p", 0.0),
+                    max_tokens=self.max_refinement_length,
+                    presence_penalty=getattr(self.args, "presence_penalty", 0.0),
+                )
+                results = {}
+                for record, prompt_ids, completion_ids in zip(
+                    all_records,
+                    generation.prompt_ids,
+                    generation.completion_ids,
+                    strict=True,
+                ):
+                    results[record["request_id"]] = {
+                        "prompt_ids": prompt_ids,
+                        "completion_ids": completion_ids,
+                    }
+                response_payload = {"ok": True, "results": results}
+            except Exception as exc:
+                response_payload = {"ok": False, "error": repr(exc)}
+
+        payload_holder = [response_payload]
+        broadcast_object_list(payload_holder, from_process=0)
+        response_payload = payload_holder[0]
+        if not response_payload["ok"]:
+            raise RuntimeError(f"Teacher refinement failed: {response_payload['error']}")
+
+        try:
+            expected_local_ids = {record["request_id"] for record in local_records}
+            local_results = {
+                request_id: result
+                for request_id, result in response_payload["results"].items()
+                if request_id in expected_local_ids
+            }
+            teacher_prompt_ids, refined_completion_ids, refined_texts = (
+                self._validate_local_refinement_results(local_records, local_results)
+            )
+            validation_status = {"ok": True, "rank": rank}
+        except Exception as exc:
+            teacher_prompt_ids, refined_completion_ids, refined_texts = [], [], []
+            validation_status = {"ok": False, "rank": rank, "error": repr(exc)}
+
+        # A tokenizer mismatch can be data/rank specific.  Never let one rank
+        # raise while its peers continue into the next gather/backward.
+        validation_statuses = gather_object([validation_status])
+        validation_payload = None
+        if self.accelerator.is_main_process:
+            failures = [status for status in validation_statuses if not status["ok"]]
+            validation_payload = {
+                "ok": not failures,
+                "error": f"Local refinement result validation failed: {failures}" if failures else None,
+            }
+        validation_holder = [validation_payload]
+        broadcast_object_list(validation_holder, from_process=0)
+        validation_payload = validation_holder[0]
+        if not validation_payload["ok"]:
+            raise RuntimeError(f"Teacher refinement failed: {validation_payload['error']}")
+
+        return teacher_prompt_ids, refined_completion_ids, refined_texts
+
+    def _validate_local_refinement_results(
+        self,
+        local_records: list[dict[str, Any]],
+        results: dict[tuple[int, int, int, int], dict[str, list[int]]],
+    ) -> tuple[list[list[int]], list[list[int]], list[str]]:
+        """Validate and decode this rank's refinement results without collectives."""
+        teacher_prompt_ids = []
+        refined_completion_ids = []
+        vocab_size = len(self.processing_class)
+        expected_ids = [record["request_id"] for record in local_records]
+        if len(set(expected_ids)) != len(expected_ids):
+            raise RuntimeError("Local refinement request IDs must be unique.")
+        if set(results) != set(expected_ids):
+            missing = sorted(set(expected_ids) - set(results))
+            unexpected = sorted(set(results) - set(expected_ids))
+            raise RuntimeError(
+                "Local refinement result IDs do not match requests: "
+                f"missing={missing}, unexpected={unexpected}."
+            )
+        for record in local_records:
+            result = results.get(record["request_id"])
+            # Exact set equality above makes this lookup total while keeping a
+            # defensive check useful for custom mapping implementations.
+            if result is None:
+                raise RuntimeError(f"Missing refinement result for {record['request_id']}.")
+            local_prompt_ids = self.processing_class.encode(
+                record["prompt"], add_special_tokens=False
+            )
+            if local_prompt_ids != result["prompt_ids"]:
+                raise RuntimeError(
+                    "Teacher vLLM prompt IDs differ from the local tokenizer; "
+                    "the endpoint model/tokenizer or prompt rendering is incorrect."
+                )
+            if any(token_id >= vocab_size for token_id in result["completion_ids"]):
+                raise RuntimeError(
+                    "Teacher vLLM returned a completion token outside the student/teacher shared "
+                    f"vocabulary of size {vocab_size}."
+                )
+            teacher_prompt_ids.append(result["prompt_ids"])
+            refined_completion_ids.append(result["completion_ids"])
+
+        refined_texts = self.processing_class.batch_decode(
+            refined_completion_ids, skip_special_tokens=True
+        )
+        return teacher_prompt_ids, refined_completion_ids, list(refined_texts)
+
+    def _raise_if_any_rank_failed(self, stage: str, error: Exception | None) -> None:
+        """Turn a rank-local pre-forward failure into one symmetric distributed failure."""
+        local_status = {
+            "ok": error is None,
+            "rank": self.accelerator.process_index,
+            "error": None if error is None else repr(error),
+        }
+        statuses = gather_object([local_status])
+        failures = [status for status in statuses if not status["ok"]]
+        if failures:
+            raise RuntimeError(f"{stage} failed on one or more ranks: {failures}")
+
+    def _record_rollout_outputs(
+        self,
+        rollout: dict[str, Any],
+        refined_texts: list[str] | None,
+    ) -> None:
+        target_texts = refined_texts or rollout["original_completion_texts"]
+        gathered_prompts = gather_object(list(rollout["prompt_texts"]))
+        gathered_original = gather_object(list(rollout["original_completion_texts"]))
+        gathered_target = gather_object(list(target_texts))
+        self._textual_logs["prompt"].extend(gathered_prompts)
+        self._textual_logs["completion"].extend(gathered_target)
+        if self.accelerator.is_main_process:
+            for prompt, original, target in zip(
+                gathered_prompts, gathered_original, gathered_target, strict=True
+            ):
+                self._generation_outputs_buffer.append(
+                    {
+                        "policy_update": self.state.global_step + 1,
+                        "rollout_step": rollout["rollout_step"],
+                        "prompt": prompt,
+                        "original_completion": original,
+                        "refined_completion": target if self.teacher_refine else None,
+                        "training_completion": target,
+                    }
+                )
+
+    def _windowed_training_step(self, model, inputs) -> torch.Tensor:
+        raw_batches = inputs.get("rollout_batches")
+        if not isinstance(raw_batches, list) or len(raw_batches) != self.rollouts_per_update:
+            raise ValueError(
+                f"Expected {self.rollouts_per_update} rollout batches in a policy window."
+            )
+
+        self._ensure_student_vllm_current()
+        rollouts = []
+        # Phase A: collect every y_o before any teacher rewrite or backward.
+        for offset, raw_batch in enumerate(raw_batches):
+            rollout = None
+            local_error = None
+            try:
+                prepared = self._prepare_inputs(raw_batch)
+                rollout_step = self.state.global_step * self.rollouts_per_update + offset + 1
+                with torch.no_grad():
+                    rollout = self._collect_original_rollout(model, prepared, rollout_step)
+                del prepared
+            except Exception as exc:
+                local_error = exc
+            if rollout is None and local_error is None:
+                local_error = RuntimeError("Student rollout returned no cache record.")
+            self._raise_if_any_rank_failed(f"Student rollout {offset}", local_error)
+            # The synchronized status above guarantees every rank has a value.
+            assert rollout is not None
+            rollouts.append(rollout)
+            empty_cache()
+
+        # Phase B: collect every y_r (or build vanilla y_o batches) on CPU.
+        cached_training_batches = []
+        for offset, rollout in enumerate(rollouts):
+            cached_batch = None
+            local_error = None
+            try:
+                if self.teacher_refine:
+                    teacher_prompt_ids, refined_ids, refined_texts = self._generate_refined_completions(
+                        rollout, offset
+                    )
+                    cached_batch = self._build_distillation_batch(
+                        rollout,
+                        target_ids=refined_ids,
+                        teacher_prompt_ids=teacher_prompt_ids,
+                    )
+                else:
+                    refined_texts = None
+                    cached_batch = self._build_vanilla_distillation_batch(rollout)
+            except Exception as exc:
+                local_error = exc
+                refined_texts = None
+            if cached_batch is None and local_error is None:
+                local_error = RuntimeError("Distillation builder returned no batch.")
+            self._raise_if_any_rank_failed(f"Distillation batch {offset}", local_error)
+            assert cached_batch is not None
+            cached_training_batches.append(cached_batch)
+            self._record_rollout_outputs(rollout, refined_texts)
+
+        # Phase C: recompute logits and accumulate gradients only after the
+        # complete window's trajectories are frozen in CPU memory.
+        window_loss = torch.zeros((), device=self.args.device)
+        previous_accumulation = self.current_gradient_accumulation_steps
+        self.current_gradient_accumulation_steps = self.rollouts_per_update
+        try:
+            for offset, cached_batch in enumerate(cached_training_batches):
+                is_last = offset == self.rollouts_per_update - 1
+                self.accelerator.gradient_state._set_sync_gradients(is_last)
+                if self.is_deepspeed_enabled:
+                    if not hasattr(model, "set_gradient_accumulation_boundary"):
+                        raise RuntimeError("DeepSpeed model lacks set_gradient_accumulation_boundary().")
+                    model.set_gradient_accumulation_boundary(is_last)
+                    sync_context = nullcontext()
+                else:
+                    sync_context = nullcontext() if is_last else self.accelerator.no_sync(model)
+                with sync_context:
+                    sub_loss = super().training_step(model, cached_batch, num_items_in_batch=None)
+                window_loss += sub_loss
+                empty_cache()
+        finally:
+            self.current_gradient_accumulation_steps = previous_accumulation
+            self.accelerator.gradient_state._set_sync_gradients(True)
+            if self.is_deepspeed_enabled and hasattr(model, "set_gradient_accumulation_boundary"):
+                model.set_gradient_accumulation_boundary(True)
+
+        loss_scalar = float(window_loss.detach())
+        self._on_policy_loss_total += loss_scalar
+        self._on_policy_step_equiv += 1.0
+        return window_loss
+
     def _save_generation_outputs(self, step: int):
         """Save generation outputs to disk."""
         if not self.accelerator.is_main_process:
@@ -1367,6 +2109,9 @@ class OPSDTrainer(SFTTrainer):
         2. Construct full sequences for both student and teacher with the generation
         3. Compute JSD loss on the generation tokens
         """
+        if self.windowed_policy_updates:
+            return self._windowed_training_step(model, inputs)
+
         on_policy = True
 
         # === REASONING PHASE (if enabled) ===
@@ -1504,14 +2249,6 @@ class OPSDTrainer(SFTTrainer):
             print(f"{'='*80}\n")
 
         loss = super().training_step(model, inputs, num_items_in_batch)
-
-        # Save generation outputs every N steps
-        if (
-            self.state.global_step > 0
-            and self.state.global_step % self._generation_save_frequency == 0
-            and self.accelerator.sync_gradients
-        ):
-            self._save_generation_outputs(self.state.global_step)
 
         loss_scalar = float(loss.detach())
         ga = max(1, int(self.args.gradient_accumulation_steps))

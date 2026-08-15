@@ -76,9 +76,9 @@ class CustomScriptArguments(ScriptArguments):
     top_k_loss: int = field(
         default=0,
         metadata={
-            "help": "Restrict the JSD loss to only the top-k tokens of the teacher distribution. Both student and "
-            "teacher distributions are renormalized over these k tokens before computing JSD. "
-            "Set to 0 (default) to use the full vocabulary."
+            "help": "Approximate forward KL over the top-k tokens of the teacher distribution. The teacher is "
+            "renormalized over those k tokens while the student retains its full-vocabulary softmax denominator, "
+            "matching Eq. (10) of arXiv:2603.07079. Requires --beta 0. Set to 0 for full-vocabulary KL."
         },
     )
     jsd_token_clip: float = field(
@@ -119,6 +119,50 @@ class CustomScriptArguments(ScriptArguments):
             "Default True. Set to False for the matched non-thinking ablation (both nonthink)."
         },
     )
+    policy_gradient_updates: int | None = field(
+        default=None,
+        metadata={
+            "help": "Number of optimizer/policy updates to perform across --max_steps rollout microbatches. "
+            "When omitted, the legacy Trainer max_steps semantics are preserved."
+        },
+    )
+    teacher_refine: bool = field(
+        default=False,
+        metadata={
+            "help": "Generate a teacher rewrite y_r for every student rollout y_o and train on y_r (TRD)."
+        },
+    )
+    max_refinement_length: int | None = field(
+        default=None,
+        metadata={"help": "Maximum y_r tokens. Defaults to --max_completion_length."},
+    )
+    distillation_temperature: float | None = field(
+        default=None,
+        metadata={
+            "help": "Temperature used only by the distillation loss. Defaults to --temperature for legacy runs; "
+            "TRD requires 1.0."
+        },
+    )
+    refinement_vllm_server_host: str = field(
+        default="127.0.0.1",
+        metadata={"help": "Host of the fixed teacher vLLM service used to generate y_r."},
+    )
+    refinement_vllm_server_port: int = field(
+        default=8002,
+        metadata={"help": "Port of the fixed teacher vLLM service used to generate y_r."},
+    )
+    refinement_vllm_connect_timeout: float = field(
+        default=10.0,
+        metadata={"help": "Teacher vLLM HTTP connection timeout in seconds."},
+    )
+    refinement_vllm_request_timeout: float = field(
+        default=1800.0,
+        metadata={"help": "Teacher vLLM generation read timeout in seconds."},
+    )
+    refinement_vllm_max_model_len: int = field(
+        default=20000,
+        metadata={"help": "Context limit configured on the teacher vLLM service."},
+    )
 
 
 def validate_algorithm_config(script_args, training_args, model_args) -> None:
@@ -126,9 +170,45 @@ def validate_algorithm_config(script_args, training_args, model_args) -> None:
     if script_args.alg not in {"opsd", "opd"}:
         raise ValueError(f"Unsupported --alg {script_args.alg!r}; expected 'opsd' or 'opd'.")
 
+    if script_args.teacher_refine:
+        if script_args.reason_first:
+            raise ValueError("--teacher_refine and --reason_first are mutually exclusive.")
+        if script_args.use_tinker_loss:
+            raise ValueError("TRD Eq. (6) requires full-vocabulary forward KL; disable --use_tinker_loss.")
+        if training_args.beta != 0:
+            raise ValueError("TRD Eq. (6) requires --beta 0 (forward KL).")
+        if script_args.top_k_loss != 0:
+            raise ValueError("TRD Eq. (6) requires --top_k_loss 0 (full vocabulary).")
+        if script_args.jsd_token_clip != 0:
+            raise ValueError("TRD Eq. (6) requires --jsd_token_clip 0.")
+        if script_args.distillation_temperature is None:
+            script_args.distillation_temperature = 1.0
+        elif script_args.distillation_temperature != 1.0:
+            raise ValueError("TRD Eq. (6) requires --distillation_temperature 1.0.")
+        if script_args.use_ema_teacher:
+            raise ValueError("--teacher_refine uses a fixed step-0 teacher and is incompatible with EMA.")
+        if script_args.max_refinement_length is None:
+            script_args.max_refinement_length = training_args.max_completion_length
+        if script_args.max_refinement_length <= 0:
+            raise ValueError("--max_refinement_length must be positive.")
+        if script_args.refinement_vllm_max_model_len <= script_args.max_refinement_length:
+            raise ValueError(
+                "--refinement_vllm_max_model_len must be larger than --max_refinement_length."
+            )
+
+    if script_args.distillation_temperature is None:
+        script_args.distillation_temperature = training_args.temperature
+
+    if script_args.top_k_loss < 0:
+        raise ValueError("--top_k_loss must be non-negative; use 0 for full-vocabulary distillation.")
+    if script_args.top_k_loss > 0 and training_args.beta != 0:
+        raise ValueError("--top_k_loss implements top-k forward KL and therefore requires --beta 0.")
+
     if script_args.alg == "opsd":
         if training_args.teacher_model_name_or_path is not None:
             raise ValueError("--teacher_model_name_or_path is only valid with --alg opd.")
+        if script_args.teacher_refine and not script_args.fixed_teacher:
+            raise ValueError("OPSD teacher refinement requires --fixed_teacher (the step-0 base model).")
         return
 
     if script_args.reason_first:
@@ -178,10 +258,58 @@ def validate_algorithm_config(script_args, training_args, model_args) -> None:
         raise ValueError("The OPD student and teacher must use the same vocabulary.")
 
 
+def configure_policy_update_schedule(script_args, training_args) -> None:
+    """Translate public rollout/update counts into Trainer outer-step semantics."""
+    schedule_enabled = script_args.policy_gradient_updates is not None or script_args.teacher_refine
+    if not schedule_enabled:
+        training_args.windowed_policy_updates = False
+        training_args.total_rollout_steps = None
+        training_args.policy_gradient_updates = None
+        training_args.rollouts_per_update = 1
+        return
+
+    total_rollout_steps = int(training_args.max_steps)
+    if total_rollout_steps <= 0:
+        raise ValueError("Windowed policy updates require an explicit --max_steps > 0.")
+
+    policy_updates = (
+        total_rollout_steps
+        if script_args.policy_gradient_updates is None
+        else int(script_args.policy_gradient_updates)
+    )
+    if not 1 <= policy_updates <= total_rollout_steps:
+        raise ValueError(
+            "--policy_gradient_updates must satisfy 1 <= U <= max_steps; "
+            f"got U={policy_updates}, max_steps={total_rollout_steps}."
+        )
+    if total_rollout_steps % policy_updates != 0:
+        raise ValueError(
+            "--max_steps must be divisible by --policy_gradient_updates; "
+            f"got {total_rollout_steps} % {policy_updates}."
+        )
+    if int(training_args.gradient_accumulation_steps) != 1:
+        raise ValueError(
+            "Windowed policy updates require --gradient_accumulation_steps 1; "
+            "the window itself performs the requested accumulation."
+        )
+    if getattr(training_args, "ignore_data_skip", False):
+        raise ValueError("Windowed policy updates require ignore_data_skip=False for exact resume semantics.")
+    if training_args.use_vllm and training_args.vllm_sync_frequency != 1:
+        raise ValueError("Windowed on-policy rollouts require --vllm_sync_frequency 1.")
+
+    training_args.windowed_policy_updates = True
+    training_args.total_rollout_steps = total_rollout_steps
+    training_args.policy_gradient_updates = policy_updates
+    training_args.rollouts_per_update = total_rollout_steps // policy_updates
+    training_args.max_steps = policy_updates
+    script_args.policy_gradient_updates = policy_updates
+
+
 if __name__ == "__main__":
     parser = TrlParser((CustomScriptArguments, GOLDConfig, ModelConfig))
     script_args, training_args, model_args = parser.parse_args_and_config()
     validate_algorithm_config(script_args, training_args, model_args)
+    configure_policy_update_schedule(script_args, training_args)
 
     ################
     # WandB Run Name & Output Directory
@@ -192,10 +320,13 @@ if __name__ == "__main__":
     # Get number of processes from environment (set by accelerate launch)
     num_processes = int(os.environ.get("WORLD_SIZE", 1))
 
-    # Calculate effective batch size
-    effective_batch_size = (
-        training_args.per_device_train_batch_size * training_args.gradient_accumulation_steps * num_processes
-    )
+    # Report rollout and optimizer-window batch sizes separately. In legacy mode
+    # effective_batch_size retains its historical gradient-accumulation meaning.
+    rollout_batch_size = training_args.per_device_train_batch_size * num_processes
+    if training_args.windowed_policy_updates:
+        effective_batch_size = rollout_batch_size * training_args.rollouts_per_update
+    else:
+        effective_batch_size = rollout_batch_size * training_args.gradient_accumulation_steps
 
     # Use custom run_config if provided, otherwise generate automatic name
     if script_args.run_config:
@@ -227,6 +358,15 @@ if __name__ == "__main__":
     print(f"{'='*80}")
     print(f"WandB Run Name: {full_wandb_run_config}")
     print(f"Output Directory: {training_args.output_dir}")
+    if training_args.windowed_policy_updates:
+        print(
+            "Rollout/update schedule: "
+            f"N={training_args.total_rollout_steps}, "
+            f"U={training_args.policy_gradient_updates}, "
+            f"R={training_args.rollouts_per_update}"
+        )
+        print(f"Rollout batch size: {rollout_batch_size}")
+        print(f"Policy update batch size: {effective_batch_size}")
     print(f"{'='*80}\n")
 
     ################
@@ -251,6 +391,10 @@ if __name__ == "__main__":
                 "learning_rate": training_args.learning_rate,
                 "per_device_train_batch_size": training_args.per_device_train_batch_size,
                 "gradient_accumulation_steps": training_args.gradient_accumulation_steps,
+                "total_rollout_steps": training_args.total_rollout_steps,
+                "policy_gradient_updates": training_args.policy_gradient_updates,
+                "rollouts_per_update": training_args.rollouts_per_update,
+                "rollout_batch_size": rollout_batch_size,
                 "effective_batch_size": effective_batch_size,
                 "num_train_epochs": training_args.num_train_epochs,
                 "max_completion_length": training_args.max_completion_length,
@@ -265,6 +409,9 @@ if __name__ == "__main__":
                 "num_processes": num_processes,
                 "use_tinker_loss": script_args.use_tinker_loss,
                 "fixed_teacher": script_args.fixed_teacher,
+                "teacher_refine": script_args.teacher_refine,
+                "max_refinement_length": script_args.max_refinement_length,
+                "distillation_temperature": script_args.distillation_temperature,
                 "top_k_loss": script_args.top_k_loss if script_args.top_k_loss > 0 else None,
                 "use_ema_teacher": script_args.use_ema_teacher,
                 "ema_decay": script_args.ema_decay if script_args.use_ema_teacher else None,
@@ -364,6 +511,14 @@ if __name__ == "__main__":
         ema_decay=script_args.ema_decay,
         student_thinking=script_args.student_thinking,
         teacher_thinking=script_args.teacher_thinking,
+        teacher_refine=script_args.teacher_refine,
+        max_refinement_length=script_args.max_refinement_length,
+        distillation_temperature=script_args.distillation_temperature,
+        refinement_vllm_server_host=script_args.refinement_vllm_server_host,
+        refinement_vllm_server_port=script_args.refinement_vllm_server_port,
+        refinement_vllm_connect_timeout=script_args.refinement_vllm_connect_timeout,
+        refinement_vllm_request_timeout=script_args.refinement_vllm_request_timeout,
+        refinement_vllm_max_model_len=script_args.refinement_vllm_max_model_len,
         alg=script_args.alg,
         teacher_model=(
             training_args.teacher_model_name_or_path if script_args.alg == "opd" else None
@@ -379,6 +534,7 @@ if __name__ == "__main__":
         completions_callback = LogCompletionsCallback(trainer, generation_config, num_prompts=8)
         trainer.add_callback(completions_callback)
 
-    trainer.train()
+    trainer.prepare_window_schedule(training_args.resume_from_checkpoint)
+    trainer.train(resume_from_checkpoint=training_args.resume_from_checkpoint)
 
     trainer.save_model(training_args.output_dir)

@@ -1,6 +1,31 @@
 import torch
 
 
+class WindowDataCollator:
+    """Collate one optimizer window as a list of ordinary rollout microbatches."""
+
+    def __init__(self, base_collator, micro_batch_size: int, window_size: int):
+        if micro_batch_size <= 0 or window_size <= 0:
+            raise ValueError("micro_batch_size and window_size must be positive.")
+        self.base_collator = base_collator
+        self.micro_batch_size = micro_batch_size
+        self.window_size = window_size
+
+    def __call__(self, features):
+        expected = self.micro_batch_size * self.window_size
+        if len(features) != expected:
+            raise ValueError(
+                f"A policy-update window requires exactly {expected} examples "
+                f"({self.window_size} x {self.micro_batch_size}); got {len(features)}."
+            )
+        return {
+            "rollout_batches": [
+                self.base_collator(features[start : start + self.micro_batch_size])
+                for start in range(0, expected, self.micro_batch_size)
+            ]
+        }
+
+
 class SelfDistillationDataCollator:
     """
     Data collator for self-distillation that creates both student and teacher inputs.
@@ -144,6 +169,11 @@ class SelfDistillationDataCollator:
             "student_prompt_length": max_student_prompt_len,  # Single value for batch!
             # Keep individual lengths for proper masking
             "student_prompt_lengths_per_example": torch.tensor(student_prompt_lengths),
+            # Raw fields are required to build teacher-refinement prompts after y_o exists.
+            "problems": [feature["problem"] for feature in features],
+            "reference_solutions": [
+                feature.get("solution") if self.alg == "opsd" else None for feature in features
+            ],
         }
 
         if self.alg == "opd":

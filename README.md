@@ -16,6 +16,13 @@ training entry point. OPD uses Qwen3-8B as a fixed external teacher and scores
 the student's on-policy completion with the same prompt and condition,
 \(\pi_T(y\mid x)\), without exposing the ground-truth solution to the teacher.
 
+It additionally implements the teacher-refinement stage from
+**Trajectory-Refined Distillation (TRD)** ([paper](https://arxiv.org/abs/2606.08432),
+[reference code](https://github.com/louieworth/trd)). The student first produces
+an on-policy answer \(y_o\), a fixed step-0 teacher rewrites it as \(y_r\), and
+the student is trained with full-vocabulary forward KL along \(y_r\). Both OPD
+and OPSD conditioning are supported.
+
 
 ## Updates
 
@@ -72,37 +79,125 @@ bash scripts/prepare_models.sh 4b
 bash scripts/prepare_models.sh 8b
 ```
 
-Run the paper's main OPSD configuration:
+### Teacher source and loss variants
+
+The two launcher directories identify only the **teacher source**:
+
+- `scripts/OPSD/`: the teacher is the same step-0 student base model with
+  privileged reference-solution context.
+- `scripts/OPD/`: the teacher is a stronger fixed Qwen3-8B model without
+  privileged reference-solution context.
+
+The next directory level selects the student size. `1B` is the short launcher
+name for the Qwen3-1.7B checkpoint:
+
+| Directory | Student | Teacher source |
+|---|---|---|
+| `scripts/OPSD/1B/` | Qwen3-1.7B | Same Qwen3-1.7B step-0 base + privileged solution |
+| `scripts/OPSD/4B/` | Qwen3-4B | Same Qwen3-4B step-0 base + privileged solution |
+| `scripts/OPSD/8B/` | Qwen3-8B | Same Qwen3-8B step-0 base + privileged solution |
+| `scripts/OPD/1B/` | Qwen3-1.7B | Fixed external Qwen3-8B, without privileged solution |
+| `scripts/OPD/4B/` | Qwen3-4B | Fixed external Qwen3-8B, without privileged solution |
+
+Every model directory exposes the same four algorithms and requires no model
+argument:
+
+| Launcher | Distillation support | Pointwise clip | Training trajectory |
+|---|---|---|---|
+| `vanilla.sh` | Full vocabulary | Off | Student rollout \(y_o\) |
+| `top_k.sh` | Teacher top-16 | Off | Student rollout \(y_o\) |
+| `clip.sh` | Full vocabulary | 0.05 (OPSD 8B: 0.06) | Student rollout \(y_o\) |
+| `trd.sh` | Full vocabulary | Off | Teacher rewrite \(y_r\) |
+
+For example:
 
 ```bash
-bash scripts/OPSD/run_opsd_1b.sh   # 8 GPUs, 100 steps, effective batch size 32
-bash scripts/OPSD/run_opsd_4b.sh   # 8 GPUs, 100 steps, effective batch size 32
-bash scripts/OPSD/run_opsd_8b.sh   # 8 GPUs, 100 steps, effective batch size 32
+bash scripts/OPSD/1B/vanilla.sh
+bash scripts/OPSD/4B/top_k.sh
+bash scripts/OPSD/8B/clip.sh
+bash scripts/OPSD/1B/trd.sh
+
+bash scripts/OPD/1B/vanilla.sh
+bash scripts/OPD/4B/top_k.sh
+bash scripts/OPD/4B/clip.sh
+bash scripts/OPD/1B/trd.sh
 ```
 
-These scripts explicitly use the paper's main training modes: the student
-rollout is thinking-mode off and the privileged teacher is thinking-mode on.
-The model, optimizer, generation, and effective-batch settings are unchanged;
-the launch topology uses all 8 GPUs and preserves effective batch size 32.
-WandB defaults to offline mode for unattended runs; use `WANDB_MODE=online`
-when desired.
+`top_k.sh` uses loss-side `k=16`, the main value reported by
+[Entropy-Aware On-Policy Distillation](https://arxiv.org/abs/2603.07079).
+It implements the paper's top-k forward-KL component: the teacher is
+renormalized on its top-16 tokens while the student keeps its full-vocabulary
+softmax denominator. It is a controlled top-k forward-KL variant, not the full
+entropy-gated EOPD objective.
 
-Run OPD with either supported student size:
+`clip.sh` uses the vocabulary-entry pointwise clipping operator from
+[Self-Distilled Reasoner](https://arxiv.org/abs/2601.18734): 0.05 for 1.7B/4B
+and 0.06 for OPSD 8B. Applying 0.05 to OPD is this repository's corresponding
+external-teacher adaptation; the clipping paper evaluated the OPSD source.
+The source-level form (`scripts/OPSD/clip.sh 1.7b`) remains available as a
+generic compatibility interface; new runs should use the model-scoped paths
+above.
+
+All four variants deliberately share rollout sampling at temperature 1.1,
+top-p 0.95, and generation `top_k=20`. Generation `top_k` controls how
+trajectories are sampled and is independent of loss-side `top_k_loss`; therefore
+`vanilla.sh`, `clip.sh`, and `trd.sh` have no **loss top-k** even though their
+common rollout sampler still uses top-k sampling.
+
+### Rollout/update cadence
+
+Every launcher defaults to 100 rollout microbatches and 100 policy updates.
+`DISTILL_MAX_STEPS=N` counts rollout microbatches and
+`DISTILL_POLICY_GRADIENT_UPDATES=U` counts optimizer/policy updates. `N` must be
+divisible by `U`; one update consumes a complete window of `N/U` rollout
+microbatches, all generated before that window's backward pass.
 
 ```bash
-bash scripts/OPD/run_opd_1b.sh   # Qwen3-1.7B student, Qwen3-8B teacher
-bash scripts/OPD/run_opd_4b.sh   # Qwen3-4B student, Qwen3-8B teacher
+# One update over all 100 rollout microbatches.
+DISTILL_MAX_STEPS=100 DISTILL_POLICY_GRADIENT_UPDATES=1 \
+    AUTO_EVAL=0 bash scripts/OPSD/1B/vanilla.sh
+
+# One update per two rollout microbatches.
+DISTILL_MAX_STEPS=100 DISTILL_POLICY_GRADIENT_UPDATES=50 \
+    AUTO_EVAL=0 bash scripts/OPD/4B/top_k.sh
+
+# One update after every rollout microbatch.
+DISTILL_MAX_STEPS=100 DISTILL_POLICY_GRADIENT_UPDATES=100 \
+    bash scripts/OPSD/4B/clip.sh
 ```
 
-The optimization, generation, and colocated-vLLM settings mirror the
-corresponding OPSD launchers and target an 8×H100-80GB node. There is
-intentionally no Qwen3-8B OPD student launcher.
+Checkpoint numbers are policy-update numbers. `DISTILL_SAVE_STEPS` must divide
+`U`; the launcher derives the automatic evaluation checkpoint list from it.
+Each source/variant/run writes to a separate evaluation namespace under
+`outputs/eval/<source>/<variant>/<run-config>/`.
 
-After training exits successfully, each main `run_opsd_*.sh` launcher
-automatically starts its matching five-dataset thinking-mode evaluation. Set
-`AUTO_EVAL=0` to train without the post-training evaluation. Evaluation scope
-can be adjusted with `CHECKPOINTS`, `DATASETS`, `VAL_N`, and the variables
-shown below.
+### Trajectory-Refined Distillation
+
+`trd.sh` adds the teacher-refinement stage and explicitly disables loss top-k
+and clipping. OPD refines with \(x+y_o\); OPSD refines with
+\(x+y^\star+y_o\). Student KL is evaluated on \(x+y_r\), while the teacher
+reuses the exact canonical refinement prefix followed by \(y_r\).
+
+TRD uses a fixed 4/4 topology on one **8×H100-80GB** node. Trainer ranks and
+their colocated student vLLM engines use GPUs 0–3; a tensor-parallel fixed
+teacher service uses GPUs 4–7. The 1,024-token budgets for both \(y_o\) and
+\(y_r\) are an H100-80GB assumption, not a supported capacity claim for 40GB
+A100 GPUs. For OPD, each trainer rank also retains the frozen Qwen3-8B
+Transformers teacher needed for full-vocabulary KL; the TP=4 service supplies
+refinement generation only.
+
+The service starts on port 8002, is health/world-size checked, monitored during
+training, cleaned up on exit or signal, and stopped before optional all-eight-GPU
+evaluation. Useful overrides include `TRD_REFINEMENT_HOST`,
+`TRD_REFINEMENT_PORT`, `TRD_REFINEMENT_MAX_MODEL_LEN`,
+`TRD_SERVER_STARTUP_TIMEOUT`, `TRD_REFINEMENT_REQUEST_TIMEOUT`, and
+`DISTILL_MAX_REFINEMENT_LENGTH`. This remains a fixed-step-0 TRD adaptation on
+the repository's current Qwen3 backbones and thinking-mode choices.
+
+After training exits successfully, each canonical launcher automatically starts
+its matching five-dataset thinking-mode evaluation. Set `AUTO_EVAL=0` to train
+without post-training evaluation. Evaluation scope can be adjusted with
+`CHECKPOINTS`, `DATASETS`, and `VAL_N`.
 
 Evaluate checkpoints 25/50/75/100 on AIME24, AIME25, BeyondAIME, HMMT25,
 and AMO-Bench:
@@ -150,8 +245,14 @@ CUDA 12.8 as well; `setup_env.sh` prints a warning when it detects a mismatch.
 ├── accelerate.yaml          # Accelerate config (multi-GPU)
 ├── scripts/
 │   ├── prepare_all.sh       # Pinned local data + HF model links
-│   ├── OPSD/               # OPSD launchers (1.7B, 4B, and 8B students)
-│   ├── OPD/                # OPD launchers (1.7B and 4B students; 8B teacher)
+│   ├── OPSD/               # Privileged same-base teacher source
+│   │   ├── 1B/             # Qwen3-1.7B student; vanilla/top_k/clip/trd
+│   │   ├── 4B/             # Qwen3-4B student; vanilla/top_k/clip/trd
+│   │   └── 8B/             # Qwen3-8B student; vanilla/top_k/clip/trd
+│   ├── OPD/                # Fixed stronger Qwen3-8B teacher source
+│   │   ├── 1B/             # Qwen3-1.7B student; vanilla/top_k/clip/trd
+│   │   └── 4B/             # Qwen3-4B student; vanilla/top_k/clip/trd
+│   ├── lib/                # Shared launcher and TRD service lifecycle helpers
 │   ├── prepare_models.sh    # Prepare all models or one selected model
 │   ├── run_eval.sh          # Model-parameterized formal evaluation
 │   ├── run_sft.sh           # SFT baseline launcher
@@ -165,10 +266,10 @@ CUDA 12.8 as well; `setup_env.sh` prints a warning when it detects a mismatch.
 
 ## Quick Start
 
-Reproduce results on Qwen3-1.7B with the portable single-node 8-GPU launcher:
+Run the paper-style clipped OPSD configuration on Qwen3-1.7B:
 
 ```bash
-bash scripts/OPSD/run_opsd_1b.sh
+bash scripts/OPSD/1B/clip.sh
 ```
 Evaluation: (evaluation takes ~ 30-50 minutes on 4xh100 for each checkpoint) 
 ```bash
@@ -230,11 +331,10 @@ bash run_eval.sh
 
 OPSD can also run in non-thinking setting where both the Qwen student and teacher are enabled_thinking=False during training (`--student_thinking False --teacher_thinking False`) and evaluated with non-thinking inference (`--no_thinking`), with faster evaluation time than thinking mode.
 
-Training:
-```bash
-bash scripts/run_opsd_4b_nonthink.sh
-bash scripts/run_opsd_8b_nonthink.sh
-```
+The unified OPSD launchers intentionally use the main student-off/teacher-on
+role configuration. The tables below retain the upstream both-nonthinking
+ablation results; launch that ablation through `opsd_train.py` directly if
+needed rather than treating it as one of the four loss/trajectory variants.
 
 Evaluation:
 ```bash
@@ -393,7 +493,9 @@ bash run_eval_nonthink.sh
 | `--use_tinker_loss` | `False` | Use sampled-token policy-gradient objective instead of full-vocabulary JSD. More memory efficient. Currently no clipped implemented for this variant, could be unstable. |
 | `--max_completion_length` | — | Student generation length for distillation. We use 1024 in our main experiments. |
 | `--beta` | — | Interpolation weight for the JSD mixture distribution. Beta=0 means forward KL and 1 means reverse KL. |
-| `--jsd_token_clip` | 0.05 | Clip the JSD loss for each token to a maximum value. This can improve stability by preventing stylistic tokens from dominating the training signal. Note when clipping is applied, the loss can be negative due to positive KL summand being capped. | 
+| `--top_k_loss` | `0` | Loss-side teacher support size. A positive value requires `beta=0`; only the teacher is renormalized on its top-k tokens while student probabilities retain the full-vocabulary denominator. |
+| `--jsd_token_clip` | 0.05 | Cap every vocabulary-entry divergence contribution before summation. Set to `0` to disable it. Since negative contributions are not clipped, the summed loss can be negative. |
+| `--policy_gradient_updates` | unset | Number of optimizer updates across `max_steps` rollout microbatches. When set, it must divide `max_steps` and requires gradient accumulation 1. |
 | `--reason_first` | `False` | Prepend an explicit rationalization to the teacher context before distillation. |
 | `--run_config` | `None` | Custom name suffix for the output directory and WandB run. |
 
