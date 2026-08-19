@@ -109,6 +109,8 @@ class PaperBaselineLauncherTests(unittest.TestCase):
         self.assertTrue(command.has_flag("--gradient_checkpointing"))
         self.assertTrue(command.has_flag("--use_peft"))
         self.assertFalse(command.has_flag("--num_train_epochs"))
+        self.assertEqual(command.value("--save_total_limit"), "1")
+        self.assertEqual(command.value("--skip_final_model_save"), "True")
 
         effective_batch = (
             int(command.value("--num_processes"))
@@ -159,6 +161,7 @@ class PaperBaselineLauncherTests(unittest.TestCase):
                 self.assertEqual(command.value("--beta"), "0.0")
                 self.assertEqual(command.value("--loss_type"), "grpo")
                 self.assertEqual(command.value("--scale_rewards"), "group")
+                self.assertEqual(command.value("--save_steps"), "20")
                 self.assertNotIn("epoch", command.value("--run_config"))
                 outputs.add(command.value("--run_config"))
         self.assertEqual(len(outputs), 3)
@@ -175,6 +178,7 @@ class PaperBaselineLauncherTests(unittest.TestCase):
                 )
                 self.assertEqual(command.value("--max_steps"), "100")
                 self.assertEqual(command.value("--max_length"), "16000")
+                self.assertEqual(command.value("--save_steps"), "100")
                 self.assertNotIn("epoch", command.value("--output_dir"))
                 outputs.add(command.value("--output_dir"))
         self.assertEqual(len(outputs), 3)

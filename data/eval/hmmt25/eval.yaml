@@ -1,0 +1,8 @@
+name: MathArena HMMT Feb 2025
+description: Problem set from the HMMT Tournament of February 2025.
+evaluation_framework: math-arena
+
+tasks:
+  - id: MathArena/hmmt_feb_2025
+    config: default
+    split: train

@@ -349,6 +349,8 @@ trd_launch() {
     local save_steps
     local run_config
     local output_root
+    local task_type="${TRD_TASK_TYPE:-math}"
+    local train_data_path="${TRD_TRAIN_DATA_PATH:-$REPO_ROOT/data/train/openthoughts_math_30k_opsd}"
 
     trd_reject_structural_overrides "${extra_training_args[@]}"
     trd_validate_positive_integer TRD_MAX_STEPS "$rollout_steps"
@@ -401,7 +403,7 @@ trd_launch() {
     fi
 
     run_config="${RUN_CONFIG:-trd_${algorithm}_${model_label}_gen${completion_length}_n${rollout_steps}_u${policy_updates}_step0teacher}"
-    output_root="$REPO_ROOT/outputs/$algorithm"
+    output_root="${TRD_OUTPUT_ROOT:-$REPO_ROOT/outputs/$algorithm}"
 
     case "$algorithm" in
         opsd)
@@ -428,9 +430,10 @@ trd_launch() {
         --gradient_accumulation_steps 1
         --main_process_port "${TRD_ACCELERATE_PORT:-12949}"
         "$REPO_ROOT/opsd_train.py"
+        --task_type "$task_type"
         --alg "$algorithm"
         --model_name_or_path "$student_model"
-        --train_dataset_path "$REPO_ROOT/data/train/openthoughts_math_30k_opsd"
+        --train_dataset_path "$train_data_path"
         --learning_rate "${TRD_LEARNING_RATE:-5e-6}"
         --max_grad_norm "${TRD_MAX_GRAD_NORM:-0.1}"
         --per_device_train_batch_size "$per_device_batch_size"
@@ -444,7 +447,7 @@ trd_launch() {
         --max_refinement_length "$refinement_length"
         --save_steps "$save_steps"
         --logging_steps "${TRD_LOGGING_STEPS:-2}"
-        --attn_implementation flash_attention_2
+        --attn_implementation "${TRD_ATTN_IMPLEMENTATION:-flash_attention_2}"
         --torch_dtype bfloat16
         --max_length "$training_max_length"
         --beta 0
@@ -465,13 +468,14 @@ trd_launch() {
         --top_k 20
         --lmbda 1
         --student_thinking False
+        --refinement_thinking False
         --teacher_refine
         --refinement_vllm_server_host "$TRD_REFINEMENT_HOST"
         --refinement_vllm_server_port "$TRD_REFINEMENT_PORT"
         --refinement_vllm_connect_timeout "$TRD_REFINEMENT_CONNECT_TIMEOUT"
         --refinement_vllm_request_timeout "$TRD_REFINEMENT_REQUEST_TIMEOUT"
         --refinement_vllm_max_model_len "$refinement_max_model_len"
-        --wandb_project TRD
+        --wandb_project "${TRD_WANDB_PROJECT:-TRD}"
         "${algorithm_args[@]}"
         "${extra_training_args[@]}"
     )

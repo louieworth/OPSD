@@ -67,6 +67,7 @@ from trl.trainer.utils import (
 from trl.experimental.gold.gold_config import GOLDConfig
 from data_collator import SelfDistillationDataCollator, WindowDataCollator
 from trd_refinement import TeacherVLLMClient, build_refinement_prompt
+from script_code.speculative_kd import SKDConfig, SpeculativeKDGenerator
 
 
 if is_peft_available():
@@ -168,6 +169,7 @@ class OPSDTrainer(SFTTrainer):
         ema_decay: float = 0.999,
         student_thinking: bool = False,
         teacher_thinking: bool = True,
+        refinement_thinking: bool = False,
         teacher_refine: bool = False,
         max_refinement_length: int | None = None,
         distillation_temperature: float | None = None,
@@ -178,6 +180,12 @@ class OPSDTrainer(SFTTrainer):
         refinement_vllm_max_model_len: int | None = None,
         alg: str = "opsd",
         teacher_model: PreTrainedModel | nn.Module | str | None = None,
+        teacher_context_max_length: int | None = None,
+        trajectory_mode: str = "student",
+        skd_draft_length: int = 5,
+        skd_accept_top_k: int = 25,
+        skd_correction_temperature: float = 0.2,
+        skd_correction_top_p: float = 1.0,
     ):
         if alg not in {"opsd", "opd"}:
             raise ValueError(f"Unsupported algorithm: {alg!r}. Expected 'opsd' or 'opd'.")
@@ -191,16 +199,22 @@ class OPSDTrainer(SFTTrainer):
             raise ValueError("use_ema_teacher is only supported by OPSD; the OPD teacher is external and fixed.")
         if alg == "opd" and fixed_teacher:
             raise ValueError("fixed_teacher is an OPSD option; the external OPD teacher is always fixed.")
+        if trajectory_mode not in {"student", "skd"}:
+            raise ValueError("trajectory_mode must be 'student' or 'skd'.")
 
         self.alg = alg
         self.teacher_refine = teacher_refine
         self.teacher_thinking = teacher_thinking
+        self.refinement_thinking = refinement_thinking
         self.max_refinement_length = max_refinement_length or args.max_completion_length
         if refinement_vllm_max_model_len is None:
             refinement_vllm_max_model_len = (
                 20_000 + self.max_refinement_length if alg == "opsd" else 20_000
             )
         self.refinement_vllm_max_model_len = refinement_vllm_max_model_len
+        self.teacher_context_max_length = int(
+            teacher_context_max_length or refinement_vllm_max_model_len
+        )
         self.student_context_max_length = int(args.max_length)
         student_response_reserve = max(
             int(args.max_completion_length), int(self.max_refinement_length)
@@ -291,6 +305,23 @@ class OPSDTrainer(SFTTrainer):
         self.policy_gradient_updates = getattr(args, "policy_gradient_updates", None)
         self.rollouts_per_update = int(getattr(args, "rollouts_per_update", 1))
         self.rollout_micro_batch_size = int(args.per_device_train_batch_size)
+        self.trajectory_mode = trajectory_mode
+        self.skd_generator = None
+        if trajectory_mode == "skd":
+            if args.use_vllm:
+                raise ValueError("SKD uses the local Transformers backend; use_vllm must be False.")
+            self.skd_generator = SpeculativeKDGenerator(
+                SKDConfig(
+                    max_new_tokens=int(args.max_completion_length),
+                    draft_length=skd_draft_length,
+                    accept_top_k=skd_accept_top_k,
+                    student_temperature=float(args.temperature),
+                    student_top_p=float(args.top_p),
+                    student_top_k=int(args.top_k),
+                    correction_temperature=skd_correction_temperature,
+                    correction_top_p=skd_correction_top_p,
+                )
+            )
         self._schedule_metadata_written = False
 
         # Validate fixed_teacher option
@@ -597,8 +628,12 @@ class OPSDTrainer(SFTTrainer):
             "dataset_fingerprint": getattr(self.train_dataset, "_fingerprint", None),
             "alg": self.alg,
             "teacher_refine": self.teacher_refine,
+            "teacher_thinking": self.teacher_thinking,
+            "refinement_thinking": self.refinement_thinking,
             "model_name_or_path": str(self.model_name_or_path),
             "teacher_model_name_or_path": getattr(self.args, "teacher_model_name_or_path", None),
+            "trajectory_mode": self.trajectory_mode,
+            "teacher_context_max_length": self.teacher_context_max_length,
             "max_length": self.student_context_max_length,
             "student_prompt_max_length": self.student_prompt_max_length,
             "max_completion_length": self.args.max_completion_length,
@@ -1639,6 +1674,12 @@ class OPSDTrainer(SFTTrainer):
     def _collect_original_rollout(self, model, inputs, rollout_step: int) -> dict[str, Any]:
         """Generate y_o and return a graph-free CPU record."""
         inputs = self._apply_reason_first(model, dict(inputs))
+        if self.trajectory_mode == "skd":
+            # The training loop hands us the Accelerate/DeepSpeed wrapper.  SKD
+            # needs the underlying PEFT module so OPSD can enter
+            # ``disable_adapter()`` while scoring each speculative block.
+            with unwrap_model_for_generation(model, self.accelerator) as unwrapped_model:
+                return self._collect_skd_rollout(unwrapped_model, inputs, rollout_step)
         if self.use_vllm:
             self._wake_vllm_if_needed()
             result = self._generate_on_policy_outputs_vllm(
@@ -1693,6 +1734,117 @@ class OPSDTrainer(SFTTrainer):
             "prompt_texts": list(prompt_texts),
             "original_completion_ids": completion_ids,
             "original_completion_texts": clean_completion_texts,
+            "raw_completion_texts": list(completion_texts),
+            "rollout_step": rollout_step,
+        }
+
+    def _collect_skd_rollout(
+        self,
+        model: nn.Module,
+        inputs: dict[str, Any],
+        rollout_step: int,
+    ) -> dict[str, Any]:
+        """Generate interleaved SKD trajectories with per-source teacher prompts."""
+        if self.skd_generator is None:
+            raise RuntimeError("SKD trajectory mode was selected without an SKD generator.")
+
+        device = self.accelerator.device
+        student_prompt_sequences = [
+            ids[mask.bool()].to(device)
+            for ids, mask in zip(
+                inputs["student_prompts"],
+                inputs["student_prompt_attention_mask"],
+                strict=True,
+            )
+        ]
+        teacher_prompt_sequences = [
+            ids[mask.bool()].to(device)
+            for ids, mask in zip(
+                inputs["teacher_prompts"],
+                inputs["teacher_prompt_attention_mask"],
+                strict=True,
+            )
+        ]
+
+        if self.alg == "opd":
+            # Keep the external teacher in the form prepared by Accelerate.  In
+            # particular, unwrapping a ZeRO-backed teacher can expose sharded
+            # parameters that are not directly callable on every rank.
+            teacher_model = self.teacher_model
+            teacher_context_factory = nullcontext
+        else:
+            teacher_model = model
+            if not is_peft_model(model):
+                raise RuntimeError("OPSD SKD requires a PEFT model so the fixed teacher can disable adapters.")
+            teacher_context_factory = model.disable_adapter
+
+        eos_token_ids = self.generation_config.eos_token_id
+        completion_ids: list[list[int]] = []
+        stats = []
+        for index, (student_prompt, teacher_prompt) in enumerate(
+            zip(student_prompt_sequences, teacher_prompt_sequences, strict=True)
+        ):
+            sample_generator = torch.Generator(device=device)
+            sample_generator.manual_seed(
+                int(self.args.seed)
+                + rollout_step * 1_000_003
+                + self.accelerator.process_index * 10_007
+                + index
+            )
+            completion, sample_stats = self.skd_generator.generate_one(
+                student_model=model,
+                teacher_model=teacher_model,
+                student_prompt_ids=student_prompt.unsqueeze(0),
+                teacher_prompt_ids=teacher_prompt.unsqueeze(0),
+                eos_token_ids=eos_token_ids,
+                generator=sample_generator,
+                teacher_context=teacher_context_factory,
+            )
+            if not completion:
+                raise RuntimeError(f"SKD generated an empty trajectory at rollout step {rollout_step}.")
+            completion_ids.append(completion)
+            stats.append(sample_stats)
+
+        prompt_tensor, prompt_mask = self._pad_token_lists(
+            [sequence.detach().cpu().tolist() for sequence in student_prompt_sequences]
+        )
+        completion_tensor, completion_mask = self._pad_token_lists(completion_ids)
+        generated_ids = torch.cat([prompt_tensor, completion_tensor], dim=1)
+        generated_attention_mask = torch.cat([prompt_mask, completion_mask], dim=1)
+        prompt_width = prompt_tensor.shape[1]
+        prompt_texts = self.processing_class.batch_decode(
+            prompt_tensor, skip_special_tokens=False
+        )
+        completion_texts = self.processing_class.batch_decode(
+            completion_ids, skip_special_tokens=True
+        )
+
+        for sample_stats, completion in zip(stats, completion_ids, strict=True):
+            self._metrics["train"]["skd/acceptance_rate"].append(
+                sample_stats.acceptance_rate
+            )
+            self._metrics["train"]["skd/accepted_prefix"].append(
+                sample_stats.average_accepted_prefix
+            )
+            self._metrics["train"]["skd/corrections"].append(
+                float(sample_stats.corrections)
+            )
+            self._metrics["train"]["skd/teacher_token_ratio"].append(
+                sample_stats.teacher_token_ratio
+            )
+            self._metrics["train"]["skd/completion_length"].append(float(len(completion)))
+            self._metrics["train"]["skd/length_cap_rate"].append(
+                float(len(completion) >= self.skd_generator.config.max_new_tokens)
+            )
+
+        return {
+            "inputs": self._detach_to_cpu(inputs),
+            "generated_ids": generated_ids,
+            "generated_attention_mask": generated_attention_mask,
+            "generated_prompt_width": prompt_width,
+            "prompt_texts": list(prompt_texts),
+            "original_completion_ids": completion_ids,
+            "original_completion_texts": list(completion_texts),
             "raw_completion_texts": list(completion_texts),
             "rollout_step": rollout_step,
         }
@@ -1767,11 +1919,14 @@ class OPSDTrainer(SFTTrainer):
         teacher_prompt_width = teacher_prompts.shape[1]
         teacher_input_ids = torch.cat([teacher_prompts, target_tensor], dim=1)
         teacher_attention_mask = torch.cat([teacher_prompt_mask, target_mask], dim=1)
-        if teacher_input_ids.shape[1] > self.refinement_vllm_max_model_len:
+        teacher_context_max_length = getattr(
+            self, "teacher_context_max_length", self.refinement_vllm_max_model_len
+        )
+        if teacher_input_ids.shape[1] > teacher_context_max_length:
             raise RuntimeError(
-                "TRD teacher KL sequence exceeded the refinement context: "
+                "teacher KL sequence exceeded its configured context: "
                 f"sequence width {teacher_input_ids.shape[1]} > "
-                f"refinement_vllm_max_model_len {self.refinement_vllm_max_model_len}."
+                f"teacher_context_max_length {teacher_context_max_length}."
             )
 
         labels = torch.full_like(student_input_ids, -100)
@@ -1806,6 +1961,15 @@ class OPSDTrainer(SFTTrainer):
         pad_token_id = self.processing_class.pad_token_id
         if pad_token_id is not None:
             teacher_attention_mask[teacher_input_ids == pad_token_id] = 0
+        teacher_context_max_length = getattr(
+            self, "teacher_context_max_length", self.refinement_vllm_max_model_len
+        )
+        if teacher_input_ids.shape[1] > teacher_context_max_length:
+            raise RuntimeError(
+                "teacher KL sequence exceeded its configured context: "
+                f"sequence width {teacher_input_ids.shape[1]} > "
+                f"teacher_context_max_length {teacher_context_max_length}."
+            )
 
         labels = generated_ids.clone()
         prompt_lengths = source["student_prompt_lengths_per_example"]
@@ -1840,7 +2004,7 @@ class OPSDTrainer(SFTTrainer):
                     problem=problem,
                     initial_response=initial_response,
                     reference_solution=reference_solution,
-                    teacher_thinking=self.teacher_thinking,
+                    teacher_thinking=self.refinement_thinking,
                     max_model_len=self.refinement_vllm_max_model_len,
                     max_refinement_length=self.max_refinement_length,
                 )
@@ -1860,8 +2024,32 @@ class OPSDTrainer(SFTTrainer):
                         local_index,
                     ),
                     "prompt": prompt,
+                    # Rewrite generation is always rendered independently from
+                    # teacher scoring.  In the main math setup y_r is generated
+                    # non-thinking, while the OPSD KL teacher is thinking.
+                    "scoring_prompt_ids": self.processing_class.encode(
+                        build_refinement_prompt(
+                            tokenizer=self.processing_class,
+                            alg=self.alg,
+                            problem=problem,
+                            initial_response=initial_response,
+                            reference_solution=reference_solution,
+                            teacher_thinking=self.teacher_thinking,
+                            max_model_len=self.refinement_vllm_max_model_len,
+                            max_refinement_length=self.max_refinement_length,
+                        ),
+                        add_special_tokens=False,
+                    ),
                 }
-                for local_index, prompt in enumerate(prompts)
+                for local_index, (prompt, problem, initial_response, reference_solution) in enumerate(
+                    zip(
+                        prompts,
+                        inputs["problems"],
+                        rollout["original_completion_texts"],
+                        inputs["reference_solutions"],
+                        strict=True,
+                    )
+                )
             ]
             local_status = {"ok": True, "rank": rank, "records": local_records}
         except Exception as exc:
@@ -1983,7 +2171,7 @@ class OPSDTrainer(SFTTrainer):
                     "Teacher vLLM returned a completion token outside the student/teacher shared "
                     f"vocabulary of size {vocab_size}."
                 )
-            teacher_prompt_ids.append(result["prompt_ids"])
+            teacher_prompt_ids.append(record.get("scoring_prompt_ids", result["prompt_ids"]))
             refined_completion_ids.append(result["completion_ids"])
 
         refined_texts = self.processing_class.batch_decode(
@@ -2072,6 +2260,12 @@ class OPSDTrainer(SFTTrainer):
                         rollout,
                         target_ids=refined_ids,
                         teacher_prompt_ids=teacher_prompt_ids,
+                    )
+                elif self.trajectory_mode == "skd":
+                    refined_texts = None
+                    cached_batch = self._build_distillation_batch(
+                        rollout,
+                        target_ids=rollout["original_completion_ids"],
                     )
                 else:
                     refined_texts = None

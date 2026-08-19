@@ -99,7 +99,7 @@ name for the Qwen3-1.7B checkpoint:
 | `scripts/OPD/1B/` | Qwen3-1.7B | Fixed external Qwen3-8B, without privileged solution |
 | `scripts/OPD/4B/` | Qwen3-4B | Fixed external Qwen3-8B, without privileged solution |
 
-Every OPD/OPSD model directory exposes the same four distillation algorithms
+Every OPD/OPSD model directory exposes the same five distillation algorithms
 and requires no model argument:
 
 | Launcher | Distillation support | Pointwise clip | Training trajectory |
@@ -107,6 +107,7 @@ and requires no model argument:
 | `vanilla.sh` | Full vocabulary | Off | Student rollout \(y_o\) |
 | `top_k.sh` | Teacher top-16 | Off | Student rollout \(y_o\) |
 | `clip.sh` | Full vocabulary | 0.05 (OPSD 8B: 0.06) | Student rollout \(y_o\) |
+| `skd.sh` | Full vocabulary | Off | Interleaved speculative KD trajectory |
 | `trd.sh` | Full vocabulary | Off | Teacher rewrite \(y_r\) |
 
 The three OPSD model directories additionally contain `sft.sh` and `grpo.sh`
@@ -119,11 +120,13 @@ For example:
 bash scripts/OPSD/1B/vanilla.sh
 bash scripts/OPSD/4B/top_k.sh
 bash scripts/OPSD/8B/clip.sh
+bash scripts/OPSD/4B/skd.sh
 bash scripts/OPSD/1B/trd.sh
 
 bash scripts/OPD/1B/vanilla.sh
 bash scripts/OPD/4B/top_k.sh
 bash scripts/OPD/4B/clip.sh
+bash scripts/OPD/4B/skd.sh
 bash scripts/OPD/1B/trd.sh
 ```
 
@@ -142,11 +145,17 @@ The source-level form (`scripts/OPSD/clip.sh 1.7b`) remains available as a
 generic compatibility interface; new runs should use the model-scoped paths
 above.
 
-All four variants deliberately share rollout sampling at temperature 1.1,
+All five variants deliberately share rollout sampling at temperature 1.1,
 top-p 0.95, and generation `top_k=20`. Generation `top_k` controls how
 trajectories are sampled and is independent of loss-side `top_k_loss`; therefore
 `vanilla.sh`, `clip.sh`, and `trd.sh` have no **loss top-k** even though their
 common rollout sampler still uses top-k sampling.
+
+`skd.sh` uses five-token student drafts, accepts draft tokens that fall in the
+teacher's top 25, and samples teacher corrections at temperature 0.2 and
+top-p 1.0. These are the only SKD-specific sampling settings. SKD uses the
+local Transformers rollout backend because verifier checks must be interleaved
+with each draft block; all other Math KD comparison parameters remain shared.
 
 ### Rollout/update cadence
 
@@ -171,8 +180,12 @@ DISTILL_MAX_STEPS=100 DISTILL_POLICY_GRADIENT_UPDATES=100 \
 ```
 
 Checkpoint numbers are policy-update numbers. `DISTILL_SAVE_STEPS` must divide
-`U`; the launcher derives the automatic evaluation checkpoint list from it.
-Each source/variant/run writes to a separate evaluation namespace under
+`U` and defaults to 25 for the 100-update runs. At each checkpoint the training
+process exits to release all GPUs, the five-dataset Math evaluation runs, and
+training resumes from that checkpoint. `save_total_limit=1` replaces the old
+checkpoint when the next segment finishes, so only one resumable checkpoint is
+retained. The final checkpoint is deleted after successful evaluation. Each
+source/variant/run writes to a separate evaluation namespace under
 `outputs/eval/<source>/<variant>/<run-config>/`.
 
 ### Trajectory-Refined Distillation
@@ -206,10 +219,13 @@ evaluation. Useful overrides include `TRD_REFINEMENT_HOST`,
 remains a fixed-step-0 TRD adaptation on the repository's current Qwen3
 backbones and thinking-mode choices.
 
-After training exits successfully, each canonical launcher automatically starts
-its matching five-dataset thinking-mode evaluation. Set `AUTO_EVAL=0` to train
-without post-training evaluation. Evaluation scope can be adjusted with
-`CHECKPOINTS`, `DATASETS`, and `VAL_N`.
+All canonical launchers automatically run matching five-dataset thinking-mode
+evaluation at each checkpoint. Math distillation evaluates at policy updates
+25/50/75/100 by default. Paper SFT evaluates only its final checkpoint-100;
+paper GRPO retains its 20-step cadence and evaluates 20/.../500. Set
+`AUTO_EVAL=0` to train without automatic evaluation, or set
+`MATH_DELETE_TRAINED_MODELS_AFTER_EVAL=0` to retain the final checkpoint.
+`DATASETS` and `VAL_N` can narrow the evaluation workload.
 
 Evaluate checkpoints 25/50/75/100 on AIME24, AIME25, BeyondAIME, HMMT25,
 and AMO-Bench:
@@ -230,8 +246,9 @@ After all checkpoints finish, `best_by_dataset.json` and
 each dataset and report the macro average, matching the paper's Table 2
 reporting convention.
 
-Long runs are resumable: completed result files are skipped. The evaluation
-scope can be narrowed without editing a script, for example:
+Long runs are resumable: completed result files and successful checkpoint
+markers are skipped. For a manual evaluation sweep, the scope can be narrowed
+without editing a script, for example:
 
 ```bash
 CHECKPOINTS="25 100" DATASETS="aime24 beyond-aime" \
@@ -262,8 +279,8 @@ CUDA 12.8 as well; `setup_env.sh` prints a warning when it detects a mismatch.
 │   │   ├── 4B/             # Qwen3-4B; distillation + SFT/GRPO baselines
 │   │   └── 8B/             # Qwen3-8B; distillation + SFT/GRPO baselines
 │   ├── OPD/                # Fixed stronger Qwen3-8B teacher source
-│   │   ├── 1B/             # Qwen3-1.7B student; vanilla/top_k/clip/trd
-│   │   └── 4B/             # Qwen3-4B student; vanilla/top_k/clip/trd
+│   │   ├── 1B/             # Qwen3-1.7B student; vanilla/top_k/clip/skd/trd
+│   │   └── 4B/             # Qwen3-4B student; vanilla/top_k/clip/skd/trd
 │   ├── lib/                # Shared distillation, baseline, and TRD helpers
 │   ├── prepare_models.sh    # Prepare all models or one selected model
 │   └── run_eval.sh          # Model-parameterized formal evaluation

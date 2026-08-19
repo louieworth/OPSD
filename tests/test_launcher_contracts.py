@@ -31,7 +31,7 @@ MODEL_DIRECTORY = {
     "4b": "Qwen3-4B",
     "8b": "Qwen3-8B",
 }
-VARIANTS = ("vanilla", "top_k", "clip", "trd")
+VARIANTS = ("vanilla", "top_k", "clip", "skd", "trd")
 
 
 class DryRun:
@@ -214,6 +214,7 @@ class LauncherContractTests(unittest.TestCase):
               for variant in VARIANTS),
             SCRIPTS_ROOT / "lib" / "distill_common.sh",
             SCRIPTS_ROOT / "lib" / "trd_common.sh",
+            SCRIPTS_ROOT / "lib" / "math_segment_common.sh",
         ]
         for script in expected:
             with self.subTest(script=script.relative_to(REPO_ROOT)):
@@ -302,7 +303,7 @@ class LauncherContractTests(unittest.TestCase):
                                 "True", dry_run.value("--teacher_thinking")
                             )
 
-        self.assertEqual(20, observed)
+        self.assertEqual(25, observed)
 
     def test_opd_rejects_8b_for_every_variant(self) -> None:
         for variant in VARIANTS:
@@ -350,6 +351,43 @@ class LauncherContractTests(unittest.TestCase):
                         "1.0", dry_run.value("--distillation_temperature")
                     )
 
+    def test_skd_uses_math_prompts_local_rollout_and_official_unique_parameters(self) -> None:
+        for source in MODEL_MATRIX:
+            with self.subTest(source=source):
+                skd = DryRun(self.run_launcher(source, "skd", "1.7b"))
+                vanilla = DryRun(self.run_launcher(source, "vanilla", "1.7b"))
+
+                self.assertEqual("math", skd.value("--task_type"))
+                self.assertEqual("skd", skd.value("--trajectory_mode"))
+                self.assertFalse(skd.has_flag("--use_vllm"))
+                self.assertEqual([], skd.values("--vllm_mode"))
+                self.assertEqual("5", skd.value("--skd_draft_length"))
+                self.assertEqual("25", skd.value("--skd_accept_top_k"))
+                self.assertEqual("0.2", skd.value("--skd_correction_temperature"))
+                self.assertEqual("1.0", skd.value("--skd_correction_top_p"))
+                self.assertEqual("0", skd.value("--top_k_loss"))
+                self.assertEqual("0", skd.value("--jsd_token_clip"))
+
+                # Strict comparison: SKD retains the same student sampler as
+                # ordinary Math KD; only speculative verification differs.
+                for option in ("--temperature", "--top_p", "--top_k"):
+                    self.assertEqual(vanilla.value(option), skd.value(option))
+
+    def test_skd_recipe_parameters_are_launcher_owned(self) -> None:
+        for option in (
+            "--trajectory_mode",
+            "--skd_draft_length",
+            "--skd_accept_top_k",
+            "--skd_correction_temperature",
+            "--skd_correction_top_p",
+        ):
+            with self.subTest(option=option):
+                completed = self.run_launcher(
+                    "OPSD", "skd", "1.7b", option, "999", expect_success=False
+                )
+                self.assertNotEqual(0, completed.returncode)
+                self.assertIn("launcher-owned", completed.stderr)
+
     def test_all_variants_use_distill_rollout_update_schedule_and_ga_one(self) -> None:
         for variant in VARIANTS:
             with self.subTest(variant=variant):
@@ -369,6 +407,8 @@ class LauncherContractTests(unittest.TestCase):
                 self.assertEqual(
                     ["1", "1"], dry_run.values("--gradient_accumulation_steps")
                 )
+                self.assertEqual("1", dry_run.value("--save_total_limit"))
+                self.assertEqual("True", dry_run.value("--skip_final_model_save"))
 
     def test_trd_legacy_schedule_environment_remains_supported(self) -> None:
         dry_run = DryRun(

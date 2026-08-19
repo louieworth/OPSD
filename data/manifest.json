@@ -1,0 +1,53 @@
+{
+  "eval/aime24": {
+    "files": [
+      "data/train-00000-of-00001.parquet"
+    ],
+    "repo_id": "HuggingFaceH4/aime_2024",
+    "revision": "2fe88a2f1091d5048c0f36abc874fb997b3dd99a",
+    "rows": 30
+  },
+  "eval/aime25": {
+    "files": [
+      "data/train-00000-of-00001-243207c6c994e1bd.parquet"
+    ],
+    "repo_id": "yentinglin/aime_2025",
+    "revision": "6f71d77b0b89b9dabe07ab466c51df33f514df7f",
+    "rows": 30
+  },
+  "eval/amo-bench": {
+    "files": [
+      "data/test-00000-of-00001.parquet"
+    ],
+    "repo_id": "meituan-longcat/AMO-Bench",
+    "revision": "2f422616c25d862984408fbbfaed63a961e8e025",
+    "rows": 50
+  },
+  "eval/beyond-aime": {
+    "files": [
+      "data/test.parquet"
+    ],
+    "repo_id": "ByteDance-Seed/BeyondAIME",
+    "revision": "c705198ae1043810b1e1693bd879250b51a7a523",
+    "rows": 100
+  },
+  "eval/hmmt25": {
+    "files": [
+      "data/train-00000-of-00001.parquet"
+    ],
+    "repo_id": "MathArena/hmmt_feb_2025",
+    "revision": "6fdc4277120810ff75aa22d2d5489b91f7a262a1",
+    "rows": 30
+  },
+  "train/openthoughts_math_30k_opsd": {
+    "files": [
+      "data/train-00000-of-00004.parquet",
+      "data/train-00001-of-00004.parquet",
+      "data/train-00002-of-00004.parquet",
+      "data/train-00003-of-00004.parquet"
+    ],
+    "repo_id": "siyanzhao/Openthoughts_math_30k_opsd",
+    "revision": "1f33e9dc2e8a1c639ca74f8024ad4a9f1f5eae62",
+    "rows": 29434
+  }
+}

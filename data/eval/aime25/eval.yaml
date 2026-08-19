@@ -1,0 +1,41 @@
+# yaml file for compatibility with inspect-ai
+
+name: Aime 25
+description: >
+  The American Invitational Mathematics Examination (AIME) is a prestigious,
+  invite-only mathematics competition for high-school students who perform in the
+  top 5% of the AMC 12 mathematics exam. It involves 15 questions of increasing
+  difficulty, with the answer to every question being a single integer from 0 to
+  999. The median score is historically between 4 and 6 questions correct (out of
+  the 15 possible). Two versions of the test are given every year (thirty
+  questions total).
+
+tasks:
+  - id: aime_25
+    config: default
+    split: train
+
+    epochs: 4
+    epoch_reducer: pass_at_1
+
+    field_spec:
+      input: problem
+      target: answer
+      id: id
+      metadata: [solution, url, year]
+
+    solvers:
+      - name: prompt_template
+        args:
+          template: >
+            Solve the following math problem efficiently and clearly.  The last line
+            of your response should be of the following format: 'Therefore, the final
+            answer is: $\\boxed{ANSWER}$. I hope it is correct' (without quotes)
+            where ANSWER is just the final number or expression that solves the
+            problem. Think step by step before answering.
+
+            {prompt}
+      - name: generate
+          
+    scorers:
+      - name: model_graded_fact

@@ -2,8 +2,10 @@ __pycache__/
 *.py[cod]
 *$py.class
 
-# Prepared data is downloaded by scripts/prepare_*_data.sh.
-data/
+# Large training/code-evaluation data is prepared after Git synchronization.
+# The small math evaluation suites and data/manifest.json stay trackable.
+data/train/
+data/eval/livecodebench_code_generation_lite/
 
 # Base models are symlinks into the Hugging Face cache.
 models/
@@ -11,5 +13,7 @@ models/
 # Repository-local runtime artifacts.
 outputs/
 .cache/
+third_party/
+script_code/runtime.env
 wandb/
 eval_results/

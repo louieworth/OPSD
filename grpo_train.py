@@ -48,6 +48,10 @@ class CustomScriptArguments(ScriptArguments):
         default="grpo-training",
         metadata={"help": "WandB project name to log runs under."},
     )
+    skip_final_model_save: bool = field(
+        default=False,
+        metadata={"help": "Skip the redundant model copy after Trainer checkpointing."},
+    )
 
 
 def extract_boxed_answer(text):
@@ -303,8 +307,8 @@ if __name__ == "__main__":
     )
 
     # Auto-resume from latest checkpoint if one exists
-    resume_from_checkpoint = None
-    if os.path.isdir(training_args.output_dir):
+    resume_from_checkpoint = training_args.resume_from_checkpoint
+    if resume_from_checkpoint is None and os.path.isdir(training_args.output_dir):
         checkpoints = sorted(
             [d for d in os.listdir(training_args.output_dir) if d.startswith("checkpoint-")],
             key=lambda x: int(x.split("-")[-1]),
@@ -315,5 +319,5 @@ if __name__ == "__main__":
 
     trainer.train(resume_from_checkpoint=resume_from_checkpoint)
 
-    # Save model
-    trainer.save_model(training_args.output_dir)
+    if not script_args.skip_final_model_save:
+        trainer.save_model(training_args.output_dir)

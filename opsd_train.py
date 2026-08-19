@@ -32,6 +32,34 @@ class CustomScriptArguments(ScriptArguments):
             "'opd' (external Qwen3-8B teacher)."
         },
     )
+    task_type: str = field(
+        default="math",
+        metadata={"help": "Task adapter: 'math' or 'code'."},
+    )
+    trajectory_mode: str = field(
+        default="student",
+        metadata={"help": "Trajectory sampler: ordinary 'student' rollout or 'skd'."},
+    )
+    student_prompt_max_length: int = field(
+        default=2_048,
+        metadata={"help": "Code-task student prompt cap; ignored by the math adapter."},
+    )
+    reference_solution_max_length: int = field(
+        default=4_096,
+        metadata={"help": "Code-task reference-solution cap used by data preparation."},
+    )
+    teacher_prompt_max_length: int = field(
+        default=8_192,
+        metadata={"help": "Code-task rendered teacher prompt cap before the completion."},
+    )
+    teacher_context_max_length: int | None = field(
+        default=None,
+        metadata={"help": "Maximum teacher prompt plus target sequence length."},
+    )
+    skd_draft_length: int = field(default=5)
+    skd_accept_top_k: int = field(default=25)
+    skd_correction_temperature: float = field(default=0.2)
+    skd_correction_top_p: float = field(default=1.0)
     use_tinker_loss: bool = field(
         default=False,
         metadata={
@@ -119,11 +147,32 @@ class CustomScriptArguments(ScriptArguments):
             "Default True. Set to False for the matched non-thinking ablation (both nonthink)."
         },
     )
+    refinement_thinking: bool = field(
+        default=False,
+        metadata={
+            "help": "Whether the TRD rewrite teacher uses Qwen3 thinking mode while generating y_r. "
+            "This is intentionally independent from --teacher_thinking, which controls only the "
+            "teacher prompt used for the subsequent KL update. Main TRD runs use False."
+        },
+    )
     policy_gradient_updates: int | None = field(
         default=None,
         metadata={
             "help": "Number of optimizer/policy updates to perform across --max_steps rollout microbatches. "
             "When omitted, the legacy Trainer max_steps semantics are preserved."
+        },
+    )
+    stop_after_policy_updates: int | None = field(
+        default=None,
+        metadata={
+            "help": "End this process after the requested cumulative policy update. "
+            "Used by segmented launchers to release all GPUs for checkpoint evaluation."
+        },
+    )
+    skip_final_model_save: bool = field(
+        default=False,
+        metadata={
+            "help": "Skip the redundant model copy at output_dir after Trainer checkpointing."
         },
     )
     teacher_refine: bool = field(
@@ -170,8 +219,54 @@ class CustomScriptArguments(ScriptArguments):
 
 def validate_algorithm_config(script_args, training_args, model_args) -> None:
     """Validate the model roles before allocating any model weights."""
+    # Keep the validation helper usable by older programmatic callers and
+    # focused unit tests that construct only the legacy argument subset.
+    argument_defaults = {
+        "task_type": "math",
+        "trajectory_mode": "student",
+        "student_prompt_max_length": 2_048,
+        "reference_solution_max_length": 4_096,
+        "teacher_prompt_max_length": 8_192,
+        "teacher_context_max_length": None,
+        "skd_draft_length": 5,
+        "skd_accept_top_k": 25,
+        "skd_correction_temperature": 0.2,
+        "skd_correction_top_p": 1.0,
+    }
+    for name, default in argument_defaults.items():
+        if not hasattr(script_args, name):
+            setattr(script_args, name, default)
     if script_args.alg not in {"opsd", "opd"}:
         raise ValueError(f"Unsupported --alg {script_args.alg!r}; expected 'opsd' or 'opd'.")
+    if script_args.task_type not in {"math", "code"}:
+        raise ValueError(
+            f"Unsupported --task_type {script_args.task_type!r}; expected 'math' or 'code'."
+        )
+    if script_args.trajectory_mode not in {"student", "skd"}:
+        raise ValueError("--trajectory_mode must be 'student' or 'skd'.")
+    for name in (
+        "student_prompt_max_length",
+        "reference_solution_max_length",
+        "teacher_prompt_max_length",
+        "skd_draft_length",
+        "skd_accept_top_k",
+    ):
+        if int(getattr(script_args, name)) <= 0:
+            raise ValueError(f"--{name} must be positive.")
+    if script_args.teacher_context_max_length is not None and script_args.teacher_context_max_length <= 0:
+        raise ValueError("--teacher_context_max_length must be positive.")
+
+    if script_args.trajectory_mode == "skd":
+        if script_args.teacher_refine:
+            raise ValueError("SKD and TRD teacher refinement are mutually exclusive trajectory modes.")
+        if getattr(training_args, "use_vllm", False):
+            raise ValueError("Strict SKD comparisons require the shared Transformers rollout backend; disable vLLM.")
+        if training_args.beta != 0 or script_args.top_k_loss != 0 or script_args.jsd_token_clip != 0:
+            raise ValueError("SKD requires full-vocabulary forward KL without loss top-k or clipping.")
+        if script_args.alg == "opsd" and not script_args.fixed_teacher:
+            raise ValueError("OPSD SKD requires --fixed_teacher for the step-0 verifier.")
+        if script_args.policy_gradient_updates is None:
+            raise ValueError("SKD requires an explicit --policy_gradient_updates window schedule.")
 
     if script_args.teacher_refine:
         if script_args.reason_first:
@@ -319,6 +414,15 @@ if __name__ == "__main__":
     script_args, training_args, model_args = parser.parse_args_and_config()
     validate_algorithm_config(script_args, training_args, model_args)
     configure_policy_update_schedule(script_args, training_args)
+    if script_args.stop_after_policy_updates is not None:
+        stop_step = int(script_args.stop_after_policy_updates)
+        total_updates = int(training_args.max_steps)
+        if not 1 <= stop_step <= total_updates:
+            raise ValueError(
+                "--stop_after_policy_updates must be between 1 and the configured "
+                f"policy update count ({total_updates}); got {stop_step}."
+            )
+        training_args.max_steps = stop_step
 
     ################
     # WandB Run Name & Output Directory
@@ -396,6 +500,8 @@ if __name__ == "__main__":
             config={
                 "model_name": model_args.model_name_or_path,
                 "alg": script_args.alg,
+                "task_type": script_args.task_type,
+                "trajectory_mode": script_args.trajectory_mode,
                 "teacher_model_name_or_path": training_args.teacher_model_name_or_path,
                 "learning_rate": training_args.learning_rate,
                 "per_device_train_batch_size": training_args.per_device_train_batch_size,
@@ -419,17 +525,23 @@ if __name__ == "__main__":
                 "use_tinker_loss": script_args.use_tinker_loss,
                 "fixed_teacher": script_args.fixed_teacher,
                 "teacher_refine": script_args.teacher_refine,
+                "refinement_thinking": script_args.refinement_thinking,
                 "max_refinement_length": script_args.max_refinement_length,
                 "student_prompt_max_length": (
-                    training_args.max_length
-                    - max(
-                        training_args.max_completion_length,
-                        script_args.max_refinement_length
-                        or training_args.max_completion_length,
+                    script_args.student_prompt_max_length
+                    if script_args.task_type == "code"
+                    else (
+                        training_args.max_length
+                        - max(
+                            training_args.max_completion_length,
+                            script_args.max_refinement_length
+                            or training_args.max_completion_length,
+                        )
+                        if script_args.teacher_refine
+                        else training_args.max_length
                     )
-                    if script_args.teacher_refine
-                    else training_args.max_length
                 ),
+                "teacher_context_max_length": script_args.teacher_context_max_length,
                 "refinement_prompt_max_length": (
                     script_args.refinement_vllm_max_model_len
                     - (script_args.max_refinement_length or training_args.max_completion_length)
@@ -441,6 +553,18 @@ if __name__ == "__main__":
                 "top_k_loss": script_args.top_k_loss if script_args.top_k_loss > 0 else None,
                 "use_ema_teacher": script_args.use_ema_teacher,
                 "ema_decay": script_args.ema_decay if script_args.use_ema_teacher else None,
+                "skd_draft_length": script_args.skd_draft_length if script_args.trajectory_mode == "skd" else None,
+                "skd_accept_top_k": script_args.skd_accept_top_k if script_args.trajectory_mode == "skd" else None,
+                "skd_correction_temperature": (
+                    script_args.skd_correction_temperature
+                    if script_args.trajectory_mode == "skd"
+                    else None
+                ),
+                "skd_correction_top_p": (
+                    script_args.skd_correction_top_p
+                    if script_args.trajectory_mode == "skd"
+                    else None
+                ),
             },
         )
 
@@ -521,11 +645,30 @@ if __name__ == "__main__":
         columns=["problem", "solution"] if script_args.alg == "opsd" else ["problem"],
     )
 
+    data_collator = None
+    if script_args.task_type == "code":
+        if script_args.reason_first:
+            raise ValueError("--reason_first is not supported by the code task adapter.")
+        from script_code.code_data import CodeDistillationDataCollator, CodeLengthConfig
+
+        data_collator = CodeDistillationDataCollator(
+            tokenizer,
+            alg=script_args.alg,
+            student_thinking=script_args.student_thinking,
+            teacher_thinking=script_args.teacher_thinking,
+            lengths=CodeLengthConfig(
+                student_prompt=script_args.student_prompt_max_length,
+                reference_solution=script_args.reference_solution_max_length,
+                teacher_prompt=script_args.teacher_prompt_max_length,
+            ),
+        )
+
     trainer = OPSDTrainer(
         model=model_args.model_name_or_path,
         args=training_args,
         train_dataset=train_dataset,
         eval_dataset=None,
+        data_collator=data_collator,
         processing_class=tokenizer,
         peft_config=get_peft_config(model_args),
         use_thinking_machines_loss=script_args.use_tinker_loss,
@@ -537,6 +680,7 @@ if __name__ == "__main__":
         ema_decay=script_args.ema_decay,
         student_thinking=script_args.student_thinking,
         teacher_thinking=script_args.teacher_thinking,
+        refinement_thinking=script_args.refinement_thinking,
         teacher_refine=script_args.teacher_refine,
         max_refinement_length=script_args.max_refinement_length,
         distillation_temperature=script_args.distillation_temperature,
@@ -549,6 +693,12 @@ if __name__ == "__main__":
         teacher_model=(
             training_args.teacher_model_name_or_path if script_args.alg == "opd" else None
         ),
+        teacher_context_max_length=script_args.teacher_context_max_length,
+        trajectory_mode=script_args.trajectory_mode,
+        skd_draft_length=script_args.skd_draft_length,
+        skd_accept_top_k=script_args.skd_accept_top_k,
+        skd_correction_temperature=script_args.skd_correction_temperature,
+        skd_correction_top_p=script_args.skd_correction_top_p,
     )
 
     if training_args.eval_strategy != "no":
@@ -563,4 +713,5 @@ if __name__ == "__main__":
     trainer.prepare_window_schedule(training_args.resume_from_checkpoint)
     trainer.train(resume_from_checkpoint=training_args.resume_from_checkpoint)
 
-    trainer.save_model(training_args.output_dir)
+    if not script_args.skip_final_model_save:
+        trainer.save_model(training_args.output_dir)

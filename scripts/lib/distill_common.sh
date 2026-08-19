@@ -11,6 +11,8 @@ DISTILL_COMMON_LOADED=1
 DISTILL_LIB_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 DISTILL_SCRIPTS_DIR="$(cd -- "$DISTILL_LIB_DIR/.." && pwd)"
 source "$DISTILL_SCRIPTS_DIR/common_env.sh"
+# shellcheck disable=SC1091
+source "$DISTILL_LIB_DIR/math_segment_common.sh"
 
 distill_die() {
     echo "Distillation launcher error: $*" >&2
@@ -42,7 +44,13 @@ distill_reject_structural_overrides() {
             --teacher_model_name_or_path|--teacher-model-name-or-path|--teacher_model_name_or_path=*|--teacher-model-name-or-path=*|\
             --fixed_teacher|--fixed-teacher|--teacher_refine|--teacher-refine|\
             --teacher_thinking|--teacher-thinking|--teacher_thinking=*|--teacher-thinking=*|\
+            --refinement_thinking|--refinement-thinking|--refinement_thinking=*|--refinement-thinking=*|\
             --student_thinking|--student-thinking|--student_thinking=*|--student-thinking=*|\
+            --trajectory_mode|--trajectory-mode|--trajectory_mode=*|--trajectory-mode=*|\
+            --skd_draft_length|--skd-draft-length|--skd_draft_length=*|--skd-draft-length=*|\
+            --skd_accept_top_k|--skd-accept-top-k|--skd_accept_top_k=*|--skd-accept-top-k=*|\
+            --skd_correction_temperature|--skd-correction-temperature|--skd_correction_temperature=*|--skd-correction-temperature=*|\
+            --skd_correction_top_p|--skd-correction-top-p|--skd_correction_top_p=*|--skd-correction-top-p=*|\
             --top_k_loss|--top-k-loss|--top_k_loss=*|--top-k-loss=*|\
             --jsd_token_clip|--jsd-token-clip|--jsd_token_clip=*|--jsd-token-clip=*|\
             --top_k|--top-k|--top_k=*|--top-k=*|\
@@ -143,6 +151,7 @@ distill_launch_standard() {
     local -a extra_training_args=("$@")
     local -a source_args=()
     local -a variant_args=()
+    local -a rollout_backend_args=()
     local -a training_command
     local clip_value="0"
 
@@ -164,12 +173,12 @@ distill_launch_standard() {
 
     case "$variant" in
         vanilla)
-            variant_args=(--top_k_loss 0 --jsd_token_clip 0)
+            variant_args=(--trajectory_mode student --top_k_loss 0 --jsd_token_clip 0)
             ;;
         top_k)
             # This is loss-distribution truncation from arXiv:2603.07079.
             # Rollout sampling independently remains --top_k 20 below.
-            variant_args=(--top_k_loss 16 --jsd_token_clip 0)
+            variant_args=(--trajectory_mode student --top_k_loss 16 --jsd_token_clip 0)
             ;;
         clip)
             if [[ "$source_name" == "opsd" && "$DISTILL_MODEL_KEY" == "8b" ]]; then
@@ -177,13 +186,36 @@ distill_launch_standard() {
             else
                 clip_value="0.05"
             fi
-            variant_args=(--top_k_loss 0 --jsd_token_clip "$clip_value")
+            variant_args=(--trajectory_mode student --top_k_loss 0 --jsd_token_clip "$clip_value")
+            ;;
+        skd)
+            # Keep the shared student sampler below unchanged.  Only these
+            # interleaved speculative-verification parameters are SKD-specific.
+            variant_args=(
+                --trajectory_mode skd
+                --top_k_loss 0
+                --jsd_token_clip 0
+                --skd_draft_length 5
+                --skd_accept_top_k 25
+                --skd_correction_temperature 0.2
+                --skd_correction_top_p 1.0
+            )
             ;;
         *)
             distill_die "unsupported non-TRD variant '$variant'"
             return 1
             ;;
     esac
+
+    if [[ "$variant" != "skd" ]]; then
+        rollout_backend_args=(
+            --use_vllm
+            --vllm_mode colocate
+            --vllm_gpu_memory_utilization "${DISTILL_STUDENT_VLLM_GPU_MEMORY_UTILIZATION:-0.6}"
+            --vllm_tensor_parallel_size 1
+            --vllm_sync_frequency 1
+        )
+    fi
 
     training_command=(
         accelerate launch
@@ -192,6 +224,7 @@ distill_launch_standard() {
         --gradient_accumulation_steps 1
         --main_process_port "${DISTILL_ACCELERATE_PORT:-12949}"
         "$REPO_ROOT/opsd_train.py"
+        --task_type math
         --alg "$source_name"
         --model_name_or_path "$DISTILL_MODEL_PATH"
         --train_dataset_path "$REPO_ROOT/data/train/openthoughts_math_30k_opsd"
@@ -211,11 +244,7 @@ distill_launch_standard() {
         --torch_dtype bfloat16
         --max_length "${DISTILL_MAX_LENGTH:-20000}"
         --beta 0
-        --use_vllm
-        --vllm_mode colocate
-        --vllm_gpu_memory_utilization "${DISTILL_STUDENT_VLLM_GPU_MEMORY_UTILIZATION:-0.6}"
-        --vllm_tensor_parallel_size 1
-        --vllm_sync_frequency 1
+        "${rollout_backend_args[@]}"
         --use_peft
         --lora_r 64
         --lora_alpha 128
@@ -225,6 +254,7 @@ distill_launch_standard() {
         --top_k 20
         --lmbda 1
         --student_thinking False
+        --refinement_thinking False
         --wandb_project "${source_name^^}"
         "${source_args[@]}"
         "${variant_args[@]}"
@@ -238,6 +268,58 @@ distill_launch_standard() {
 
     export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
     "${training_command[@]}"
+}
+
+distill_execute_standard_segment() {
+    local target_step="$1"
+    local resume_checkpoint="$2"
+    local source_name="$3"
+    local variant="$4"
+    local rollout_steps="$5"
+    local policy_updates="$6"
+    local completion_length="$7"
+    local save_steps="$8"
+    local run_config="$9"
+    local output_root="${10}"
+    shift 10
+    local -a segment_args=("$@" --stop_after_policy_updates "$target_step")
+    if [[ -n "$resume_checkpoint" ]]; then
+        segment_args+=(--resume_from_checkpoint "$resume_checkpoint")
+    fi
+    distill_launch_standard \
+        "$source_name" \
+        "$variant" \
+        "$rollout_steps" \
+        "$policy_updates" \
+        "$completion_length" \
+        "$save_steps" \
+        "$run_config" \
+        "$output_root" \
+        "${segment_args[@]}"
+}
+
+distill_execute_trd_segment() {
+    local target_step="$1"
+    local resume_checkpoint="$2"
+    local source_name="$3"
+    local model_key="$4"
+    local model_label="$5"
+    local student_model="$6"
+    local refiner_model="$7"
+    local per_device_batch_size="$8"
+    shift 8
+    local -a segment_args=("$@" --stop_after_policy_updates "$target_step")
+    if [[ -n "$resume_checkpoint" ]]; then
+        segment_args+=(--resume_from_checkpoint "$resume_checkpoint")
+    fi
+    AUTO_EVAL=0 trd_launch \
+        "$source_name" \
+        "$model_key" \
+        "$model_label" \
+        "$student_model" \
+        "$refiner_model" \
+        "$per_device_batch_size" \
+        "${segment_args[@]}"
 }
 
 distill_launch() {
@@ -262,12 +344,13 @@ distill_launch() {
     local eval_experiment_dir
     local result_root
     local clip_suffix=""
+    local -a segment_args
 
     if [[ "$source_name" != "opd" && "$source_name" != "opsd" ]]; then
         distill_die "unsupported teacher source '$source_name'"
         return 1
     fi
-    if [[ "$variant" != "vanilla" && "$variant" != "top_k" && "$variant" != "clip" && "$variant" != "trd" ]]; then
+    if [[ "$variant" != "vanilla" && "$variant" != "top_k" && "$variant" != "clip" && "$variant" != "trd" && "$variant" != "skd" ]]; then
         distill_die "unsupported variant '$variant'"
         return 1
     fi
@@ -317,10 +400,16 @@ distill_launch() {
             fi
             ;;
         trd) clip_suffix="step0teacher" ;;
+        skd) clip_suffix="draft5_accept25" ;;
     esac
     run_config="${RUN_CONFIG:-${source_name}_${DISTILL_RUN_MODEL_LABEL}_${variant}_gen${completion_length}_n${rollout_steps}_u${policy_updates}_${clip_suffix}}"
     eval_experiment_dir="$output_root/$run_config"
     result_root="${RESULT_ROOT:-$REPO_ROOT/outputs/eval/$source_name/$variant/$run_config}"
+    segment_args=(
+        --save_total_limit 1
+        --skip_final_model_save True
+        "${extra_training_args[@]}"
+    )
 
     if [[ "$variant" == "trd" ]]; then
         export TRD_MAX_STEPS="$rollout_steps"
@@ -336,18 +425,59 @@ distill_launch() {
         else
             DISTILL_REFINER_MODEL="$REPO_ROOT/models/Qwen3-8B"
         fi
-        trd_launch \
+        if [[ "${DISTILL_DRY_RUN:-0}" == "1" ]]; then
+            trd_launch \
+                "$source_name" \
+                "$DISTILL_MODEL_KEY" \
+                "$DISTILL_MODEL_LABEL" \
+                "$DISTILL_MODEL_PATH" \
+                "$DISTILL_REFINER_MODEL" \
+                "$DISTILL_PER_DEVICE_BATCH_SIZE" \
+                "${segment_args[@]}"
+            return
+        fi
+        math_run_segmented_training \
+            "$policy_updates" \
+            "$save_steps" \
+            "$eval_experiment_dir" \
+            "$DISTILL_MODEL_KEY" \
+            "$result_root" \
+            "$run_config" \
+            distill_execute_trd_segment \
             "$source_name" \
             "$DISTILL_MODEL_KEY" \
             "$DISTILL_MODEL_LABEL" \
             "$DISTILL_MODEL_PATH" \
             "$DISTILL_REFINER_MODEL" \
             "$DISTILL_PER_DEVICE_BATCH_SIZE" \
-            "${extra_training_args[@]}"
+            "${segment_args[@]}"
         return
     fi
 
-    distill_launch_standard \
+    if [[ "${DISTILL_DRY_RUN:-0}" == "1" ]]; then
+        distill_launch_standard \
+            "$source_name" \
+            "$variant" \
+            "$rollout_steps" \
+            "$policy_updates" \
+            "$completion_length" \
+            "$save_steps" \
+            "$run_config" \
+            "$output_root" \
+            "${segment_args[@]}"
+        printf 'EVAL_EXPERIMENT_DIR: %s\n' "$eval_experiment_dir"
+        printf 'RESULT_ROOT: %s\n' "$result_root"
+        return 0
+    fi
+
+    math_run_segmented_training \
+        "$policy_updates" \
+        "$save_steps" \
+        "$eval_experiment_dir" \
+        "$DISTILL_MODEL_KEY" \
+        "$result_root" \
+        "$run_config" \
+        distill_execute_standard_segment \
         "$source_name" \
         "$variant" \
         "$rollout_steps" \
@@ -356,20 +486,5 @@ distill_launch() {
         "$save_steps" \
         "$run_config" \
         "$output_root" \
-        "${extra_training_args[@]}"
-
-    if [[ "${DISTILL_DRY_RUN:-0}" == "1" ]]; then
-        printf 'EVAL_EXPERIMENT_DIR: %s\n' "$eval_experiment_dir"
-        printf 'RESULT_ROOT: %s\n' "$result_root"
-        return 0
-    fi
-
-    if [[ "${AUTO_EVAL:-1}" == "1" ]]; then
-        export GPU_IDS="${GPU_IDS:-0,1,2,3,4,5,6,7}"
-        export TP_SIZE="${TP_SIZE:-8}"
-        export CHECKPOINTS="${CHECKPOINTS:-$(distill_default_checkpoints "$policy_updates" "$save_steps")}" 
-        export RESULT_ROOT="$result_root"
-        EVAL_EXPERIMENT_DIR="$eval_experiment_dir" \
-            bash "$DISTILL_SCRIPTS_DIR/run_eval.sh" "$DISTILL_MODEL_KEY"
-    fi
+        "${segment_args[@]}"
 }

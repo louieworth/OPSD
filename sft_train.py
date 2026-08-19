@@ -27,6 +27,10 @@ class CustomScriptArguments(ScriptArguments):
         default="data/train/openthoughts_math_30k_opsd",
         metadata={"help": "Repository-relative path to the prepared OpenThoughts dataset."},
     )
+    skip_final_model_save: bool = field(
+        default=False,
+        metadata={"help": "Skip the redundant model copy after Trainer checkpointing."},
+    )
 
 
 def make_format_fn(tokenizer):
@@ -167,5 +171,16 @@ if __name__ == "__main__":
         peft_config=get_peft_config(model_args),
     )
 
-    trainer.train()
-    trainer.save_model(training_args.output_dir)
+    resume_from_checkpoint = training_args.resume_from_checkpoint
+    if resume_from_checkpoint is None and os.path.isdir(training_args.output_dir):
+        checkpoints = sorted(
+            [d for d in os.listdir(training_args.output_dir) if d.startswith("checkpoint-")],
+            key=lambda x: int(x.split("-")[-1]),
+        )
+        if checkpoints:
+            resume_from_checkpoint = os.path.join(training_args.output_dir, checkpoints[-1])
+            print(f"Resuming from checkpoint: {resume_from_checkpoint}")
+
+    trainer.train(resume_from_checkpoint=resume_from_checkpoint)
+    if not script_args.skip_final_model_save:
+        trainer.save_model(training_args.output_dir)

@@ -146,6 +146,21 @@ class AlgorithmConfigTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "requires --distillation_temperature 1.0"):
             validate_algorithm_config(script_args, self.training_args(), SimpleNamespace())
 
+    def test_skd_accepts_math_task_with_local_rollout_backend(self):
+        script_args = self.trd_args(
+            task_type="math",
+            trajectory_mode="skd",
+            teacher_refine=False,
+            policy_gradient_updates=100,
+        )
+        training_args = self.training_args()
+        training_args.use_vllm = False
+
+        validate_algorithm_config(script_args, training_args, SimpleNamespace())
+
+        self.assertEqual(script_args.task_type, "math")
+        self.assertEqual(script_args.trajectory_mode, "skd")
+
 
 class TRDLengthBudgetTests(unittest.TestCase):
     class StopAfterBaseTrainerInit(Exception):
@@ -547,6 +562,16 @@ class LocalRefinementResultValidationTests(unittest.TestCase):
         self.assertEqual(completion_ids, [[10, 11], [12]])
         self.assertEqual(texts, ["10/11", "12"])
 
+    def test_returns_independent_teacher_scoring_prompt_ids(self):
+        self.records[0]["scoring_prompt_ids"] = [91, 92]
+        self.records[1]["scoring_prompt_ids"] = [93]
+
+        prompt_ids, _, _ = self.trainer._validate_local_refinement_results(
+            self.records, self.results
+        )
+
+        self.assertEqual(prompt_ids, [[91, 92], [93]])
+
     def test_rejects_missing_request_before_next_collective(self):
         del self.results[(0, 0, 0, 1)]
 
@@ -568,7 +593,7 @@ class LocalRefinementResultValidationTests(unittest.TestCase):
     def test_rejects_unexpected_local_result(self):
         self.results[(0, 0, 0, 2)] = {"prompt_ids": [4], "completion_ids": [13]}
 
-        with self.assertRaisesRegex(RuntimeError, "unexpected=\[\(0, 0, 0, 2\)\]"):
+        with self.assertRaisesRegex(RuntimeError, r"unexpected=\[\(0, 0, 0, 2\)\]"):
             self.trainer._validate_local_refinement_results(self.records, self.results)
 
 
