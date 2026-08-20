@@ -2,9 +2,11 @@ __pycache__/
 *.py[cod]
 *$py.class
 
-# Large training/code-evaluation data is prepared after Git synchronization.
-# The small math evaluation suites and data/manifest.json stay trackable.
-data/train/
+# OpenThoughts math is intentionally synchronized through Git. Other large
+# training/code-evaluation data is prepared after Git synchronization.
+data/train/*
+!data/train/openthoughts_math_30k_opsd/
+!data/train/openthoughts_math_30k_opsd/**
 data/eval/livecodebench_code_generation_lite/
 
 # Base models are symlinks into the Hugging Face cache.

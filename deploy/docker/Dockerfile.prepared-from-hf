@@ -1,0 +1,54 @@
+# syntax=docker/dockerfile:1.7
+
+# Build this once from the other repository's existing job image. The resulting
+# image contains the pinned OPSD artifact and is what every EC2 job should run.
+ARG BASE_IMAGE
+FROM ${BASE_IMAGE}
+
+ARG OPSD_GIT_REV
+ARG OPSD_ARTIFACT_REPO
+ARG OPSD_ARTIFACT_RELEASE
+ARG OPSD_ARTIFACT_REVISION
+ARG CODE_PYTHON_BIN=python
+
+ENV OPSD_ROOT=/workspace/OPSD \
+    OPSD_GIT_REV=${OPSD_GIT_REV} \
+    OPSD_ARTIFACT_REPO=${OPSD_ARTIFACT_REPO} \
+    OPSD_ARTIFACT_RELEASE=${OPSD_ARTIFACT_RELEASE} \
+    OPSD_ARTIFACT_REVISION=${OPSD_ARTIFACT_REVISION} \
+    OPSD_HF_MAX_WORKERS=1 \
+    OPSD_HF_DOWNLOAD_ATTEMPTS=8 \
+    OPSD_HF_INITIAL_JITTER_SECONDS=0 \
+    CODE_PYTHON_BIN=${CODE_PYTHON_BIN} \
+    HF_HOME=/opt/huggingface
+
+WORKDIR /workspace/OPSD
+COPY . /workspace/OPSD
+COPY deploy/docker/baked_code_job_entrypoint.sh /usr/local/bin/opsd-baked-code-entrypoint
+
+# Only this one image build reads the private HF artifact. The token is mounted
+# as a BuildKit secret and is absent from the resulting image/history. Cleanup
+# happens in the same layer, leaving only the installed, verified release.
+RUN --mount=type=secret,id=hf_token,required=false \
+    set -eu; \
+    test -n "$OPSD_GIT_REV"; \
+    test -n "$OPSD_ARTIFACT_REPO"; \
+    test -n "$OPSD_ARTIFACT_RELEASE"; \
+    test -n "$OPSD_ARTIFACT_REVISION"; \
+    if [ -s /run/secrets/hf_token ]; then \
+        export HF_TOKEN="$(tr -d '\r\n' < /run/secrets/hf_token)"; \
+    fi; \
+    python script_code/fetch_artifacts.py --target-root /workspace/OPSD; \
+    bash script_code/prepare_code.sh artifact; \
+    rm -rf \
+        .cache/code_artifacts \
+        .cache/cuda \
+        .cache/huggingface \
+        .cache/pip \
+        .cache/tmp \
+        .cache/torch_extensions \
+        .cache/triton \
+        .cache/vllm
+
+ENTRYPOINT ["/usr/local/bin/opsd-baked-code-entrypoint"]
+CMD ["bash"]

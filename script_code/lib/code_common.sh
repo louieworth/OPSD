@@ -21,6 +21,9 @@ CODE_GRPO_EVAL_EVERY_STEPS="${CODE_GRPO_EVAL_EVERY_STEPS:-50}"
 CODE_DELETE_TRAINED_MODELS_AFTER_EVAL="${CODE_DELETE_TRAINED_MODELS_AFTER_EVAL:-1}"
 CODE_EVAL_RUNNER="${CODE_EVAL_RUNNER:-$CODE_ROOT/eval/run_code_eval.sh}"
 CODE_SEED="${CODE_SEED:-42}"
+CODE_AUTO_PREPARE="${CODE_AUTO_PREPARE:-1}"
+CODE_PREPARE_SCRIPT="${CODE_PREPARE_SCRIPT:-$CODE_ROOT/prepare_code.sh}"
+CODE_PREPARE_LOCK_FILE="${CODE_PREPARE_LOCK_FILE:-$REPO_ROOT/.cache/code_prepare.lock}"
 
 code_die() {
     echo "Code experiment launcher error: $*" >&2
@@ -57,10 +60,60 @@ code_select_model() {
     esac
 }
 
+code_prepare_under_lock() {
+    if bash "$CODE_PREPARE_SCRIPT" verify >/dev/null 2>&1; then
+        echo "[code prepare] Existing train/eval preparation verified."
+        return 0
+    fi
+
+    echo "[code prepare] Train/eval inputs are missing or incomplete; running prepare_code.sh all..."
+    bash "$CODE_PREPARE_SCRIPT" all
+}
+
+code_ensure_prepared() {
+    if [[ "${CODE_DRY_RUN:-0}" == "1" || "$CODE_AUTO_PREPARE" == "0" ]]; then
+        return 0
+    fi
+    [[ "$CODE_AUTO_PREPARE" == "1" ]] || {
+        code_die "CODE_AUTO_PREPARE must be 0 or 1"
+        return
+    }
+    [[ -f "$CODE_PREPARE_SCRIPT" ]] || {
+        code_die "preparation script not found: $CODE_PREPARE_SCRIPT"
+        return
+    }
+
+    mkdir -p "$(dirname -- "$CODE_PREPARE_LOCK_FILE")"
+    if command -v flock >/dev/null 2>&1; then
+        if ! (
+            exec 9>"$CODE_PREPARE_LOCK_FILE"
+            flock 9
+            code_prepare_under_lock
+        ); then
+            code_die "automatic code train/eval preparation failed"
+            return
+        fi
+    else
+        echo "[code prepare] Warning: flock is unavailable; preparing without a host-local lock." >&2
+        code_prepare_under_lock || {
+            code_die "automatic code train/eval preparation failed"
+            return
+        }
+    fi
+
+    # The first preparation creates runtime.env after this library was sourced,
+    # so load it again before training/evaluation starts in the current process.
+    if [[ -f "$CODE_ROOT/runtime.env" ]]; then
+        # shellcheck disable=SC1091
+        source "$CODE_ROOT/runtime.env"
+    fi
+}
+
 code_require_inputs() {
     if [[ "${CODE_DRY_RUN:-0}" == "1" ]]; then
         return
     fi
+    code_ensure_prepared
     [[ -d "$CODE_MODEL_PATH" ]] || code_die "model not found: $CODE_MODEL_PATH"
     [[ -d "$CODE_DATA_PATH" ]] || code_die "prepared TACO data not found: $CODE_DATA_PATH"
 }

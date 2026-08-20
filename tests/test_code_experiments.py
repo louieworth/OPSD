@@ -298,6 +298,70 @@ class CodeLauncherTests(unittest.TestCase):
         self.assertIn('CODE_EVAL_PASS_K:-12', wrapper)
         self.assertIn('default=12', decoder)
 
+    def test_real_launcher_input_check_prepares_once_then_verifies(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            model = root / "model"
+            data = root / "data"
+            log = root / "prepare.log"
+            prepare = root / "prepare.sh"
+            prepare.write_text(
+                "#!/usr/bin/env bash\n"
+                "set -euo pipefail\n"
+                'printf "%s\\n" "$1" >> "$CODE_PREPARE_TEST_LOG"\n'
+                'if [[ "$1" == "verify" ]]; then\n'
+                '    [[ -d "$CODE_PREPARE_TEST_MODEL" && -d "$CODE_PREPARE_TEST_DATA" ]]\n'
+                "else\n"
+                '    mkdir -p "$CODE_PREPARE_TEST_MODEL" "$CODE_PREPARE_TEST_DATA"\n'
+                "fi\n"
+            )
+            prepare.chmod(0o755)
+            env = os.environ.copy()
+            env.update(
+                {
+                    "CODE_PREPARE_SCRIPT": str(prepare),
+                    "CODE_PREPARE_LOCK_FILE": str(root / "prepare.lock"),
+                    "CODE_PREPARE_TEST_LOG": str(log),
+                    "CODE_PREPARE_TEST_MODEL": str(model),
+                    "CODE_PREPARE_TEST_DATA": str(data),
+                }
+            )
+            subprocess.run(
+                [
+                    "bash",
+                    "-c",
+                    'source "$1"; CODE_MODEL_PATH="$2"; CODE_DATA_PATH="$3"; '
+                    "code_require_inputs; code_require_inputs",
+                    "code-auto-prepare-test",
+                    str(SCRIPT_ROOT / "lib/code_common.sh"),
+                    str(model),
+                    str(data),
+                ],
+                cwd=REPO_ROOT,
+                env=env,
+                check=True,
+                text=True,
+                capture_output=True,
+            )
+            self.assertEqual(log.read_text().splitlines(), ["verify", "all", "verify"])
+
+    def test_dry_run_does_not_trigger_automatic_preparation(self):
+        env = os.environ.copy()
+        env.update(
+            {
+                "CODE_DRY_RUN": "1",
+                "CODE_PREPARE_SCRIPT": "/does/not/exist",
+            }
+        )
+        subprocess.run(
+            ["bash", str(SCRIPT_ROOT / "Baselines/1B/sft.sh")],
+            cwd=REPO_ROOT,
+            env=env,
+            check=True,
+            text=True,
+            capture_output=True,
+        )
+
     def test_post_eval_cleanup_removes_weights_but_keeps_metadata(self):
         output_root = REPO_ROOT / "outputs/code/test-cleanup"
         output_root.mkdir(parents=True, exist_ok=True)
@@ -403,7 +467,7 @@ class CodeLauncherTests(unittest.TestCase):
 
 
 class GitPreparationTests(unittest.TestCase):
-    def test_large_data_is_ignored_but_small_math_eval_is_trackable(self):
+    def test_only_openthoughts_train_data_and_small_math_eval_are_trackable(self):
         ignored = subprocess.run(
             [
                 "git",
@@ -419,13 +483,17 @@ class GitPreparationTests(unittest.TestCase):
         )
         self.assertEqual(ignored.returncode, 0, ignored.stderr)
 
-        math_eval = subprocess.run(
-            ["git", "check-ignore", "data/eval/aime24/data/train-00000-of-00001.parquet"],
-            cwd=REPO_ROOT,
-            text=True,
-            capture_output=True,
-        )
-        self.assertNotEqual(math_eval.returncode, 0)
+        for trackable in (
+            "data/train/openthoughts_math_30k_opsd/data/train-00000-of-00004.parquet",
+            "data/eval/aime24/data/train-00000-of-00001.parquet",
+        ):
+            result = subprocess.run(
+                ["git", "check-ignore", trackable],
+                cwd=REPO_ROOT,
+                text=True,
+                capture_output=True,
+            )
+            self.assertNotEqual(result.returncode, 0, trackable)
 
     def test_one_command_preparer_exposes_scoped_modes(self):
         completed = subprocess.run(
@@ -435,12 +503,14 @@ class GitPreparationTests(unittest.TestCase):
             capture_output=True,
         )
         self.assertEqual(completed.returncode, 0, completed.stderr)
-        self.assertIn("all|train|eval|verify", completed.stderr)
+        self.assertIn("all|train|eval|artifact|verify", completed.stderr)
 
         source = (SCRIPT_ROOT / "prepare_code.sh").read_text()
-        self.assertIn('"$REPO_ROOT/scripts/prepare_data.py" --scope train', source)
-        self.assertIn('"$SCRIPT_DIR/prepare_data.py"', source)
-        self.assertIn('"$SCRIPT_DIR/prepare_eval_data.py"', source)
+        self.assertIn('"$CODE_PREPARE_ROOT/scripts/prepare_data.py" --scope train', source)
+        self.assertIn('"$CODE_PREPARE_DIR/prepare_data.py"', source)
+        self.assertIn('"$CODE_PREPARE_DIR/prepare_eval_data.py"', source)
+        self.assertNotIn('"$SCRIPT_DIR/preflight.py"', source)
+        self.assertIn("artifact) prepare_artifact_runtime", source)
 
 
 if __name__ == "__main__":

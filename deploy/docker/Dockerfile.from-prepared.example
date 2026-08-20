@@ -1,0 +1,10 @@
+# The other repository can add its own submitter/runtime files on top of the
+# immutable prepared image. Pin PREPARED_IMAGE by ECR digest in production.
+ARG PREPARED_IMAGE
+FROM ${PREPARED_IMAGE}
+
+WORKDIR /workspace/job
+COPY . /workspace/job
+
+# Keep the inherited opsd-baked-code-entrypoint. Arguments supplied by the EC2
+# job are executed only after its offline integrity check succeeds.

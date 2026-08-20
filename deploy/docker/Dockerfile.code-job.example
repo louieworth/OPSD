@@ -1,0 +1,19 @@
+# Adapt the base image to the CUDA/PyTorch stack used by your job repository.
+ARG BASE_IMAGE
+FROM ${BASE_IMAGE}
+
+ARG OPSD_GIT_REV
+
+# The OPSD source can instead be mounted at runtime. If it is copied into the
+# image, the Docker build context must contain it at ./OPSD.
+COPY OPSD /workspace/OPSD
+COPY OPSD/deploy/docker/code_job_entrypoint.sh /usr/local/bin/opsd-code-job-entrypoint
+
+ENV OPSD_ROOT=/workspace/OPSD \
+    OPSD_GIT_REV=${OPSD_GIT_REV} \
+    OPSD_HF_MAX_WORKERS=1 \
+    OPSD_HF_DOWNLOAD_ATTEMPTS=8 \
+    OPSD_HF_INITIAL_JITTER_SECONDS=600
+
+WORKDIR /workspace/OPSD
+ENTRYPOINT ["/usr/local/bin/opsd-code-job-entrypoint"]

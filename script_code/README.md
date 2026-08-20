@@ -122,24 +122,32 @@ The default suite is HumanEval+, MBPP+, and LiveCodeBench v6. Results are
 merged into `outputs/code_eval/results.json`. Evaluation supports both full
 models and PEFT adapters.
 
-## Git synchronization and one-command preparation
+## Git synchronization and automatic preparation
 
-Git contains the complete experiment code and the small math evaluation sets.
-It intentionally does **not** contain training data, model weights,
-LiveCodeBench v6, cloned evaluator repositories, caches, or outputs. After
-pulling this repository on the 8xH100 server, activate the OPSD Python
-environment and run:
+Git contains the complete experiment code, the 29,434-row OpenThoughts math
+training artifact, and the small math evaluation sets. It intentionally does
+**not** contain the prepared TACO code artifact, model weights, LiveCodeBench
+v6, cloned evaluator repositories, caches, or outputs.
+
+After pulling this repository on a worker, activate the OPSD Python environment
+and launch the requested code experiment directly:
 
 ```bash
 git pull
 conda activate opsd
-bash script_code/prepare_code.sh all
+bash script_code/OPSD/1B/skd.sh
 ```
 
-That single command prepares and validates all Git-external train/eval
-components:
+Every real launcher passes through the shared `code_common.sh` input check. It
+first runs an offline `prepare_code.sh verify`; when verification fails, it
+automatically runs `prepare_code.sh all` before starting the job. A repo-local
+`flock` prevents duplicate preparation by concurrent launchers sharing the same
+checkout. `CODE_DRY_RUN=1` never prepares or downloads anything. Set
+`CODE_AUTO_PREPARE=0` only when the container entrypoint has already prepared
+and verified all inputs.
 
-- pinned OpenThoughts math train data (29,434 rows);
+Automatic preparation covers these Git-external train/eval components:
+
 - pinned TACO, filtered once into the shared 18,862-row clean code artifact;
 - pinned EvalPlus source plus HumanEval+ and MBPP+ data;
 - the TRD-pinned LiveCodeBench evaluator with the local Qwen/PEFT patch;
@@ -148,9 +156,124 @@ components:
   FlashAttention 2/SDPA selection;
 - all 34 launcher commands through a no-model dry run.
 
-The command is idempotent: validated datasets and pinned checkouts are reused.
-It requires network access on the target server. To prepare only one side, use
-`train`, `eval`, or `verify` instead of `all`.
+Preparation is idempotent: validated datasets and pinned checkouts are reused.
+The first real code run on a fresh worker requires network access. Manual
+`bash script_code/prepare_code.sh all` remains available for image builds and
+diagnostics; `train`, `eval`, and `verify` retain their scoped behavior.
+
+## Optional prepared Docker image for isolated EC2 jobs
+
+If job-start download time later becomes important, an alternative is to run
+`prepare_code.sh all` once during `docker build`, push that immutable prepared
+image to ECR, and run every job from its digest. Those job containers perform
+only an offline `verify`; they do not download datasets or repeat TACO
+filtering. See `deploy/docker/README.md` and
+`deploy/docker/Dockerfile.prepared-code`.
+
+If even an ECR layer pull is unacceptable at job startup, pull the image before
+creating the EBS-backed launch AMI. The Docker storage layer will then already
+exist on every new instance.
+
+## Optional immutable HF artifact releases and S3 fallback
+
+For fleets that later need centralized artifacts, prepare once, publish one
+immutable release to a Hugging Face **dataset** repository, and pin both the
+release name and the returned Hub commit:
+
+```bash
+bash script_code/prepare_code.sh all
+
+export HF_TOKEN='<write token used only by the publisher>'
+python script_code/publish_artifacts.py \
+  --repo-id YOUR_ORG/opsd-code-artifacts
+unset HF_TOKEN
+```
+
+The publisher runs the full preflight, hashes every file, stages hard links
+below `.cache/code_artifact_publish/`, and uploads these components below
+`releases/<content-id>/`:
+
+- the OpenThoughts and clean TACO training artifacts;
+- all six LiveCodeBench v6 data files;
+- the pinned, patched EvalPlus and LiveCodeBench sources;
+- the prefetched HumanEval+ and MBPP+ cache.
+
+It intentionally excludes models, checkpoints, outputs, transient compiler
+caches, nested Git metadata, and `runtime.env`. The last item is regenerated
+inside each container because it contains absolute Python and repository paths.
+
+The command prints four deployment values. Keep all four in the job
+definition; never deploy from the floating `main` revision:
+
+```text
+OPSD_ARTIFACT_REPO=YOUR_ORG/opsd-code-artifacts
+OPSD_ARTIFACT_RELEASE=v1-...
+OPSD_ARTIFACT_REVISION=<full HF commit SHA>
+OPSD_GIT_REV=<full OPSD Git commit SHA>
+```
+
+Direct HF download is supported and deliberately uses one worker, a
+process-local file lock, bounded exponential backoff, and optional startup
+jitter:
+
+```bash
+export OPSD_ARTIFACT_REPO='YOUR_ORG/opsd-code-artifacts'
+export OPSD_ARTIFACT_RELEASE='v1-...'
+export OPSD_ARTIFACT_REVISION='<full HF commit SHA>'
+export OPSD_HF_MAX_WORKERS=1
+export OPSD_HF_INITIAL_JITTER_SECONDS=600
+python script_code/fetch_artifacts.py
+bash script_code/prepare_code.sh artifact
+```
+
+This reduces bursts but cannot coordinate separate EC2 instances. When baking
+the artifact into an ECR image is unsuitable, mirror the already-staged release
+to S3 exactly once:
+
+```bash
+export OPSD_ARTIFACT_RELEASE='v1-...'
+export OPSD_ARTIFACT_STAGE="$PWD/.cache/code_artifact_publish/$OPSD_ARTIFACT_RELEASE"
+export OPSD_ARTIFACT_S3_URI='s3://YOUR_BUCKET/opsd'
+bash deploy/aws/mirror_code_artifact_to_s3.sh
+```
+
+Grant worker instances `s3:GetObject` on only that prefix through an EC2 IAM
+role. Do not put `HF_TOKEN` or long-lived AWS keys in the image or job
+definition. Each EC2 bootstrap downloads from S3 into its instance-local
+directory; `flock` prevents duplicate downloads if several containers land on
+the same host:
+
+```bash
+export OPSD_ARTIFACT_RELEASE='v1-...'
+export OPSD_ARTIFACT_S3_URI='s3://YOUR_BUCKET/opsd'
+export OPSD_EC2_ARTIFACT_ROOT='/srv/opsd'
+bash deploy/aws/ec2_fetch_code_artifact.sh
+```
+
+Mount the host root once so the artifact installer can use hard links instead
+of storing a second copy, then start the job container:
+
+```bash
+docker run --rm --gpus all --ipc=host \
+  -v /srv/opsd:/workspace/opsd \
+  -v /srv/opsd/models:/workspace/opsd/repo/models:ro \
+  -e OPSD_ROOT=/workspace/opsd/repo \
+  -e OPSD_ARTIFACT_SOURCE_DIR=/workspace/opsd/artifacts/$OPSD_ARTIFACT_RELEASE \
+  YOUR_ECR_IMAGE:TAG \
+  bash script_code/OPSD/1B/skd.sh
+```
+
+The host checkout must be at `/srv/opsd/repo`. The image entrypoint template is
+`deploy/docker/code_job_entrypoint.sh`; an example wrapper Dockerfile is at
+`deploy/docker/Dockerfile.code-job.example`. With the S3 path, workers make no
+HF requests and need no HF token. If S3 is not configured, the same entrypoint
+can fall back to the three pinned HF environment variables above.
+
+Base Qwen weights are not part of this artifact. A fleet must also avoid having
+every EC2 call `prepare_models.sh`: mirror each pinned model snapshot once to
+S3, bake it into an AMI/EBS snapshot, or provide a shared read-only model
+volume. For short-lived GPU instances, an EBS snapshot or a same-region S3
+mirror is preferable to repeated Hub downloads.
 
 Model weights are also intentionally outside Git. Prepare all three pinned
 base checkpoints separately:
